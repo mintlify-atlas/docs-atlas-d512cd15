@@ -1,47 +1,147 @@
 ---
-title: "Quickstart"
-description: "Begin with a guide on the fastest path to a successful outcome"
+title: "BDB-Genomics ATAC-seq Pipeline: Quickstart Guide"
+sidebarTitle: "Quickstart"
+description: "Run your first BDB-Genomics ATAC-seq pipeline end-to-end in minutes — from environment setup to inspecting results in results/."
 ---
 
-Describe how someone begins using your product. What is the first thing they need to do? Are there any prerequisites?
-
-A quickstart should take someone from zero to using your product. They'll get a quick win and a sense of what they can accomplish.
-
-## Prerequisites
-
-Before you begin, you must have:
-
-- Requirement one (for example, Node.js 18+, a free account, an API key)
-- Requirement two (for example, a compatible device, a compatible browser, a compatible operating system)
-
-## Get started
+This guide gets you from a bare machine to a completed pipeline run as quickly as possible. You will create a Snakemake Conda environment, clone the repository, generate lightweight synthetic test data (no internet downloads required for the CI path), and execute both the bulk and single-cell modes. By the end you will have a full `results/` directory tree with BAMs, peaks, QC reports, and footprinting outputs ready to inspect.
 
 <Steps>
-  <Step title="Install">
-    Describe how to install your product or sign up.
+
+  <Step title="Create the Conda environment">
+    The pipeline requires **Snakemake ≥ 8.0** and **Python ≥ 3.9** on the host. Create a dedicated environment using the `conda-forge` and `bioconda` channels:
 
     ```bash
-    npm install your-package
+    conda create -n atacseq snakemake>=8.0 -c conda-forge -c bioconda
+    conda activate atacseq
+    ```
+
+    <Note>
+      All per-rule tool dependencies (Bowtie2, MACS2, TOBIAS, ArchR, etc.) are resolved automatically by Snakemake at runtime via the `--use-conda` flag. You do not need to install them manually.
+    </Note>
+  </Step>
+
+  <Step title="Clone the repository">
+    ```bash
+    git clone https://github.com/BDB-Genomics/atacseq-pipeline.git
+    cd atacseq-pipeline
     ```
   </Step>
-  <Step title="Configure">
-    Describe any setup or configuration needed before first use.
+
+  <Step title="Generate synthetic test data">
+    For CI runs or offline environments, the pipeline ships a self-contained data generator that creates FASTQ files, a FASTA reference, a GTF annotation, and Bowtie2 indices — with TSS-targeted reads designed to pass all QC thresholds without requiring any external downloads:
 
     ```bash
-    your-cli init
+    python3 rules/scripts/generate_test_data.py
     ```
+
+    <Tip>
+      If you have internet access and prefer to validate the pipeline against real chromatin data, skip this step and use the ENCODE downloader in the next optional step instead.
+    </Tip>
   </Step>
-  <Step title="Run it">
-    Show the first thing a user does to see it working.
+
+  <Step title="(Optional) Download real ENCODE data">
+    This script fetches ENCSR356KRQ chr19 + chrM from ENCODE (~200 MB), GENCODE v44 annotations, JASPAR motif files, and builds all required indices automatically:
 
     ```bash
-    your-cli start
+    bash rules/scripts/download_real_data.sh
     ```
+
+    <Note>
+      This step requires an active internet connection and approximately 200 MB of disk space. It is not needed when using the synthetic data generated in the previous step.
+    </Note>
   </Step>
+
+  <Step title="Point config.yaml at your sample sheet">
+    Open `config.yaml` and confirm that `global.samples` points at your sample manifest. For the synthetic data path it should read:
+
+    ```yaml
+    global:
+      mode: "bulk"
+      samples: "data/fastp/samples.tsv"
+    ```
+
+    The sample sheet (`samples.tsv`) is a tab-separated file with columns `sample`, `condition`, `replicate`, `fastq_r1`, and `fastq_r2`. The synthetic data generator creates this file automatically; for real data, edit it to reference your own FASTQ paths.
+
+    <Warning>
+      The `global.samples` path is relative to the repository root. If you move the sample sheet, update this key accordingly — the pipeline raises a `ValueError` at startup if no samples are found.
+    </Warning>
+  </Step>
+
+  <Step title="Validate your configuration">
+    Run the pre-flight validation script before launching Snakemake. It checks every required key and path in `config.yaml` and prints specific error messages for any missing or malformed values:
+
+    ```bash
+    python3 rules/scripts/validate_config.py config.yaml
+    ```
+
+    A clean run prints no errors and exits with code 0. The Snakemake workflow also runs this validation automatically on startup, but running it manually first saves time if there are configuration issues.
+  </Step>
+
+  <Step title="Run the bulk ATAC-seq pipeline">
+    Launch the full bulk-mode pipeline using 8 CPU cores. Snakemake will automatically build and cache all per-rule Conda environments on the first run:
+
+    ```bash
+    snakemake --use-conda --cores 8
+    ```
+
+    You will see a startup banner reporting the mode and number of detected samples:
+
+    ```
+    [START] BDB-Genomics ATAC-seq Framework
+    Mode: BULK
+    Samples: 2 samples detected
+    ```
+
+    <Tip>
+      On a resource-constrained machine (≤ 4 GB RAM), use the bundled low-resource profile to cap per-rule memory allocation:
+
+      ```bash
+      snakemake --use-conda --cores 4 --profile profile/low_resource
+      ```
+    </Tip>
+  </Step>
+
+  <Step title="(Optional) Run the single-cell ATAC-seq pipeline">
+    Switch modalities by setting the `ATAC_MODE` environment variable. The pipeline will load the Chromap, ArchR, and Cicero rule sets instead of the bulk toolchain:
+
+    ```bash
+    ATAC_MODE=scatac snakemake --use-conda --cores 8
+    ```
+
+    <Note>
+      Single-cell mode replaces alignment (Chromap `--preset atac`), filtering (ArchR Arrow file creation and doublet removal), and peak calling (ArchR marker peaks). It also adds Cicero co-accessibility analysis with a 500 bp window and 250 kb distance cutoff.
+    </Note>
+  </Step>
+
 </Steps>
 
-<Tip>
-  Give people a way to get help. This could be a link to a support page, a chat with a customer support agent, or a forum for your product.
+## Expected Outputs
 
-  Example: Need help? Reach out to us at [support@yourcompany.com](mailto:support@yourcompany.com).
+On successful completion, all outputs are written to the `results/` directory, organized by stage:
+
+| Directory | Contents |
+|---|---|
+| `results/alignment/` | Post-filtered, sorted, Tn5-shifted BAMs |
+| `results/metrics_qc/` | MultiQC HTML report aggregating FastQC, Preseq, Picard, and QC Gate JSONs |
+| `results/peak_calling/` | MACS2 narrowPeak files, consensus BEDs, and IDR replicate sets |
+| `results/peak_calling/differential_accessibility/` | DESeq2 tables, Volcano/MA/PCA plots |
+| `results/peak_calling/footprinting/` | HINT-ATAC footprint BEDs |
+| `results/peak_calling/tobias/` | TOBIAS bias-corrected BigWigs and BINDetect motif plots |
+| `results/reporting/` | `pipeline_execution_summary.json` and benchmark TSV |
+| `benchmarks/` | Per-rule CPU time and peak memory consumption |
+
+The final MultiQC report is written to `results/reporting/multiqc/multiqc_report.html` and is the recommended entry point for reviewing run quality.
+
+<Tip>
+  To override individual QC thresholds without editing `config.yaml` — for example, to disable the FRiP requirement during a quick test — create an override file and pass both configs to Snakemake:
+
+  ```bash
+  # custom_override.yaml
+  # qc_gate:
+  #   params:
+  #     min_frip: 0.0
+
+  snakemake --configfile config.yaml custom_override.yaml --use-conda --cores 8
+  ```
 </Tip>

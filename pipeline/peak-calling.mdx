@@ -1,0 +1,430 @@
+---
+title: "Peak Calling: MACS2, IDR, DESeq2, TOBIAS & HOMER"
+sidebarTitle: "Peak Calling"
+description: "Complete peak-calling module covering MACS2, blacklist filtering, FRiP, IDR, consensus peaks, DESeq2 DA, TOBIAS footprinting, HINT-ATAC, and HOMER motifs."
+---
+
+Peak calling is the most analytically dense stage of the pipeline. Starting from the Tn5-shifted, QC-gated BAM files, the pipeline calls peaks with MACS2, filters them against the ENCODE blacklist, computes the Fraction of Reads in Peaks, identifies reproducible peaks across replicates with IDR, merges all samples into a consensus peak set, quantifies accessibility with a count matrix, runs DESeq2 for differential accessibility, annotates peaks with ChIPseeker, scans for enriched motifs with HOMER, and performs transcription-factor footprinting with both TOBIAS and HINT-ATAC. Each tool is an independent Snakemake rule and produces outputs in well-defined directories under `results/peak_calling/`.
+
+## MACS2 Peak Calling
+
+MACS2 operates in paired-end BAMPE mode, which uses actual fragment size information rather than estimating it from a shift model — hence `--nomodel`. The genome size is computed at parse time by summing the chromosome lengths from `genome.chrom.sizes`, so no manual genome-size string is needed:
+
+```python
+# rules/macs2_peak_calling.smk — params block
+gsize = sum(
+    int(line.strip().split()[1])
+    for line in open(config['global']['references']['genome_sizes'])
+)
+```
+
+```yaml
+# config.yaml
+macs2:
+  input:
+    shifted_bam: "results/post_alignment/tn5_shift"
+  output:
+    peaks: "results/peak_calling/macs2_peakcall"
+  params:
+    genome_size: "hs"     # only used as label; actual gsize computed dynamically
+    qvalue: 0.01
+    nomodel: "--nomodel"
+    format: "BAMPE"
+  threads: 8
+  resources:
+    mem_mb: 16000
+    time: 240
+```
+
+```bash
+macs2 callpeak \
+    -t {input.shifted_bam} \
+    -f BAMPE \
+    -g {params.gsize} \
+    -n {wildcards.sample} \
+    --outdir {params.dir} \
+    --nomodel \
+    -q 0.01 \
+    2> {log}
+```
+
+Output: `results/peak_calling/macs2_peakcall/{sample}_peaks.narrowPeak`
+
+<Note>
+  BAMPE format instructs MACS2 to use the full paired-end fragment rather than shifting single-end reads. This is the correct mode for paired-end ATAC-seq and produces more accurate peak summit positions.
+</Note>
+
+## Blacklist Filtering
+
+Raw MACS2 peaks may overlap ENCODE blacklist regions. `bedtools intersect -v` removes any peak that overlaps the blacklist:
+
+```yaml
+# config.yaml
+blacklist_filter:
+  input:
+    peaks: "results/peak_calling/macs2_peakcall"
+  output:
+    filtered_peaks: "results/peak_calling/filtered_peaks"
+  params:
+    blacklist: "data/reference/ENCODE_blacklist.bed"
+  threads: 4
+  resources:
+    mem_mb: 4000
+    time: 60
+```
+
+```bash
+bedtools intersect -v \
+    -a {input.peaks} \
+    -b {params.blacklist} \
+> {output.filtered_peaks}
+```
+
+Output: `results/peak_calling/filtered_peaks/{sample}_filtered_peaks.bed`
+
+## FRiP Calculation
+
+The Fraction of Reads in Peaks measures library enrichment: a well-prepared ATAC-seq library should have FRiP ≥ 0.2. The rule uses `samtools view -c -f 64` (count R1 reads) for total fragments and `bedtools coverage -counts` for fragments overlapping peaks:
+
+```bash
+total_fragments=$(samtools view -c -f 64 {input.shifted_bam})
+fragments_in_peaks=$(bedtools coverage -counts \
+    -a {input.filtered_peaks} \
+    -b {input.shifted_bam} \
+    | awk '{sum += $4} END {print sum+0}')
+frip=$(echo "scale=6; ${fragments_in_peaks} / ${total_fragments}" | bc)
+echo -e "FRiP\t$frip" > {output.frip}
+```
+
+Output: `results/peak_calling/frip_calculation/{sample}_frip.txt`
+
+The FRiP value is later consumed by `parse_qc_metrics.py` at the QC gate.
+
+## IDR — Irreproducible Discovery Rate
+
+IDR quantifies replicate concordance by comparing peak rank lists between pairs of replicates within each condition. Replicate pairs are auto-computed from the sample sheet at pipeline startup using `itertools.combinations`:
+
+```python
+# Snakefile — IDR target generation
+from itertools import combinations
+from collections import defaultdict
+
+_cond_reps = defaultdict(list)
+for row in rows:
+    _cond_reps[row["condition"]].append(row["replicate"])
+
+IDR_TARGETS = [
+    expand("{path}/{condition}_rep{rep1}_rep{rep2}_idr_peaks.bed",
+           path=config['idr']['output']['idr_peaks'],
+           condition=[cond], rep1=[pair[0]], rep2=[pair[1]])
+    for cond, reps in _cond_reps.items()
+    for pair in combinations(sorted(set(reps)), 2)
+]
+```
+
+```yaml
+# config.yaml
+idr:
+  output:
+    idr_peaks:     "results/peak_calling/idr/idr_peaks"
+    optimal_peaks: "results/peak_calling/idr/optimal_peaks"
+    plots:         "results/peak_calling/idr/plots"
+  params:
+    idr_threshold: 0.05
+    rank_column:   "score"
+  threads: 4
+  resources:
+    mem_mb: 4000
+    time: 60
+```
+
+```bash
+idr \
+    --samples {input.rep1} {input.rep2} \
+    --input-file-type narrowPeak \
+    --rank score \
+    --output-file {output.idr_peaks} \
+    --idr-threshold 0.05 \
+    --plot \
+    --log-output-file {log}
+```
+
+<Tip>
+  IDR requires at least ~20 peaks per replicate to converge. For test datasets with few peaks, the rule includes a graceful fallback that concatenates both replicate peak files as a proxy IDR output so the DAG can complete without error.
+</Tip>
+
+Outputs:
+- `{condition}_rep{N}_rep{M}_idr_peaks.bed` — peaks passing IDR threshold
+- `{condition}_rep{N}_rep{M}_optimal_peaks.bed` — optimal peak set
+- `{condition}_rep{N}_rep{M}_idr_plot.png` — IDR score scatter plot
+
+## Consensus Peaks
+
+The consensus peaks rule merges filtered peaks from all samples, requiring a peak to be present in at least `min_samples` samples and merging overlapping peaks within `merge_distance` bp:
+
+```yaml
+# config.yaml
+consensus_peaks:
+  output:
+    consensus: "results/peak_calling/consensus_peaks"
+    counts:    "results/peak_calling/consensus_peaks"
+  params:
+    min_samples:    2
+    merge_distance: 100
+  threads: 4
+  resources:
+    mem_mb: 8000
+    time: 120
+```
+
+The shell block performs three passes: sort-merge all peaks with `bedtools merge -d 100`, intersect each sample's peaks against the merged set to count per-sample support, then retain only peaks with support in ≥ `min_samples` samples.
+
+Outputs:
+- `results/peak_calling/consensus_peaks/consensus_peaks.bed` — final consensus set
+- `results/peak_calling/consensus_peaks/peak_sample_counts.txt` — per-peak sample counts
+
+## Count Matrix (DESeq2 Input)
+
+`bedtools coverage` is run per sample against the consensus peak set to produce per-peak read counts. These TSVs form the count matrix fed into DESeq2:
+
+```yaml
+# config.yaml
+count_peaks:
+  input:
+    shifted_bam: "results/post_alignment/tn5_shift"
+  output: "results/peak_calling/count_peaks"
+  threads: 2
+  resources:
+    mem_mb: 2000
+    time: 30
+```
+
+Output: `results/peak_calling/count_peaks/{sample}_peak_counts.tsv`
+
+## Differential Accessibility (DESeq2)
+
+Differential accessibility analysis uses DESeq2 (via an R script) on the count matrix, with the sample sheet providing condition labels. Peaks with FDR ≤ 0.05 and |log2FC| ≥ 1.0 are reported as significantly differentially accessible:
+
+```yaml
+# config.yaml
+differential_accessibility:
+  output:
+    results: "results/peak_calling/differential_accessibility"
+    plots:   "results/peak_calling/differential_accessibility/plots"
+  params:
+    fdr_threshold:   0.05
+    log2fc_threshold: 1.0
+  threads: 8
+  resources:
+    mem_mb: 16000
+    time: 240
+```
+
+Outputs:
+- `diff_accessibility_results.tsv` — full DESeq2 results table
+- `volcano_plot.pdf` — log2FC vs −log10(FDR)
+- `ma_plot.pdf` — log2FC vs mean normalized counts
+- `pca_plot.pdf` — sample-level PCA of normalized accessibility
+- `heatmap.pdf` — top differentially accessible peaks across samples
+
+## Peak Annotation (ChIPseeker)
+
+ChIPseeker annotates each blacklist-filtered peak with its nearest genomic feature using a TxDb object built from the GTF annotation. Peaks within ±3 kb of a TSS are labeled "Promoter":
+
+```yaml
+# config.yaml
+peak_annotation:
+  input:
+    filtered_peaks: "results/peak_calling/filtered_peaks"
+  output: "results/peak_calling/peak_annotation"
+  params:
+    gff:    "data/reference/annotation.gtf"
+    genome: "data/reference/genome.fa"
+  threads: 8
+  resources:
+    mem_mb: 16000
+    time: 240
+```
+
+```r
+txdb     <- makeTxDbFromGFF(params.gff, format="gtf")
+peakAnno <- annotatePeak(peakfile, TxDb=txdb, tssRegion=c(-3000, 3000))
+write.table(as.data.frame(peakAnno), output.annotation, sep="\t")
+```
+
+Outputs:
+- `{sample}_peak_annotation.txt` — per-peak annotation with `distanceToTSS`
+- `{sample}_peak_annotation_summary.txt` — genomic feature breakdown table
+
+## Motif Analysis (HOMER)
+
+HOMER `findMotifsGenome.pl` scans the filtered peak set for enriched known and de novo motifs. The pipeline searches motif lengths of 8, 10, and 12 bp in 200 bp windows:
+
+```yaml
+# config.yaml
+motif_analysis:
+  input:
+    filtered_peaks: "results/peak_calling/filtered_peaks"
+  output: "results/peak_calling/motif_analysis"
+  params:
+    motif_db:         "data/motifs/jaspar_vertebrates.meme"
+    genome_assembly:  "data/reference/genome.fa"
+  threads: 8
+  resources:
+    mem_mb: 16000
+    time: 240
+```
+
+```bash
+findMotifsGenome.pl {input.filtered_peaks} {params.genome_assembly} {output.html} \
+    -p {threads} \
+    -len 8,10,12 \
+    -size 200
+```
+
+Output: `results/peak_calling/motif_analysis/{sample}/` (directory with `homerResults.html`, `knownResults.html`)
+
+## TF Footprinting — TOBIAS
+
+TOBIAS identifies transcription factor binding sites within open chromatin by correcting for Tn5 insertion bias and scoring nucleotide-level footprint depth. The pipeline runs three sequential TOBIAS rules:
+
+<Steps>
+  <Step title="ATACorrect">
+    Corrects Tn5 sequence bias across the genome. Inputs: filtered BAM, blacklist-filtered peaks, reference FASTA, and blacklist BED. Outputs a bias-corrected BigWig and a raw bias-track BigWig:
+
+    ```yaml
+    tobias:
+      input:
+        filtered_bam: "results/post_alignment/samtools_view"
+      output:
+        corrected_bw: "results/peak_calling/tobias/corrected_bw"
+        bias_track:   "results/peak_calling/tobias/bias_track"
+        footprint_bw: "results/peak_calling/tobias/footprint_bw"
+        bindetect:    "results/peak_calling/tobias/bindetect"
+      params:
+        genome_fa:     "data/reference/genome.fa"
+        genome_sizes:  "data/reference/genome.chrom.sizes"
+        blacklist:     "data/reference/ENCODE_blacklist.bed"
+        motif_db:      "data/motifs/jaspar_vertebrates.meme"
+        conditions:    "condition"
+      threads: 8
+      resources:
+        mem_mb: 16000
+        time: 240
+    ```
+
+    Output: `results/peak_calling/tobias/corrected_bw/{sample}_corrected.bw`
+    Output: `results/peak_calling/tobias/bias_track/{sample}_bias.bw`
+  </Step>
+  <Step title="ScoreBigwig">
+    Computes per-nucleotide footprint scores from the bias-corrected BigWig and peak regions:
+
+    Output: `results/peak_calling/tobias/footprint_bw/{sample}_footprints.bw`
+  </Step>
+  <Step title="BINDetect">
+    Runs differential TF binding analysis across all samples using the consensus peak set, all corrected BigWigs, and the JASPAR motif database:
+
+    ```bash
+    TOBIAS BINDetect \
+        --signals {corrected_bw_1} {corrected_bw_2} ... \
+        --motifs {input.motif_db} \
+        --genome {input.genome} \
+        --peaks  {input.peaks} \
+        --outdir {output.bindetect_dir} \
+        --cores  {threads}
+    ```
+
+    Output: `results/peak_calling/tobias/bindetect/` (directory)
+  </Step>
+</Steps>
+
+## TF Footprinting — HINT-ATAC (RGT)
+
+HINT-ATAC provides an independent footprinting implementation using the Regulatory Genomics Toolbox (`rgt-hint`). It runs per-sample on the filtered BAM and blacklist-filtered peaks with the `hg38` organism parameter:
+
+```yaml
+# config.yaml
+footprinting:
+  input:
+    filtered_bam: "results/post_alignment/samtools_view"
+  output:
+    footprints: "results/peak_calling/footprinting/footprints"
+    plots:      "results/peak_calling/footprinting/plots"
+  params:
+    organism: "hg38"
+  threads: 8
+  resources:
+    mem_mb: 16000
+    time: 240
+```
+
+```bash
+rgt-hint footprinting \
+    --atac-seq \
+    --paired-end \
+    --organism=hg38 \
+    --output-location={params.tmp_dir} \
+    --output-prefix={wildcards.sample} \
+    {input.bam} \
+    {input.peaks}
+```
+
+Output: `results/peak_calling/footprinting/footprints/{sample}_footprints.bed`
+
+<Note>
+  If the peak file is empty (zero peaks), both TOBIAS BINDetect and HINT-ATAC detect this condition and create empty placeholder outputs rather than failing the DAG. This mirrors the behavior described in the QC Gating page.
+</Note>
+
+## chromVAR Motif Accessibility
+
+chromVAR computes per-sample motif deviation scores that capture cell-type-specific transcription factor accessibility without requiring peak-level differential testing:
+
+```yaml
+# config.yaml
+chromvar_analysis:
+  input:
+    shifted_bam: "results/post_alignment/tn5_shift"
+  output:
+    deviations:     "results/peak_calling/chromvar/deviations"
+    bias_corrected: "results/peak_calling/chromvar/bias_corrected"
+    plots:          "results/peak_calling/chromvar/plots"
+  params:
+    motif_db:     "data/motifs/jaspar_vertebrates.meme"
+    genome_fa:    "data/reference/genome.fa"
+    genome_sizes: "data/reference/genome.chrom.sizes"
+  threads: 8
+  resources:
+    mem_mb: 16000
+    time: 240
+```
+
+Output: `results/peak_calling/chromvar/deviations/{sample}_deviations.tsv`
+
+## Output Summary
+
+<CardGroup cols={2}>
+  <Card title="MACS2 Peaks" icon="mountain">
+    `results/peak_calling/macs2_peakcall/{sample}_peaks.narrowPeak`
+  </Card>
+  <Card title="Filtered Peaks" icon="filter">
+    `results/peak_calling/filtered_peaks/{sample}_filtered_peaks.bed`
+  </Card>
+  <Card title="IDR Peaks" icon="copy">
+    `results/peak_calling/idr/idr_peaks/{cond}_rep{N}_rep{M}_idr_peaks.bed`
+  </Card>
+  <Card title="Consensus Peaks" icon="layer-group">
+    `results/peak_calling/consensus_peaks/consensus_peaks.bed`
+  </Card>
+  <Card title="DESeq2 Results" icon="chart-bar">
+    `results/peak_calling/differential_accessibility/diff_accessibility_results.tsv`
+  </Card>
+  <Card title="TOBIAS BINDetect" icon="magnifying-glass">
+    `results/peak_calling/tobias/bindetect/`
+  </Card>
+  <Card title="HINT-ATAC Footprints" icon="shoe-prints">
+    `results/peak_calling/footprinting/footprints/{sample}_footprints.bed`
+  </Card>
+  <Card title="HOMER Motifs" icon="dna">
+    `results/peak_calling/motif_analysis/{sample}/`
+  </Card>
+</CardGroup>

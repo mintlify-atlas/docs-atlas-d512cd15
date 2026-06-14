@@ -1,0 +1,155 @@
+---
+title: "GEOAgent Bridge: From GEO Metadata to Pipeline"
+sidebarTitle: "GEO Agent"
+description: "How to use the GEOAgent bridge to convert a GEO metadata CSV into a pipeline-ready config_geo.yaml and samples TSV, with optional SRA download."
+---
+
+The GEOAgent bridge (`rules/scripts/geo_agent_bridge.py`) is the integration layer between AI-assisted dataset discovery tools — such as GEOAgent or bioStream — and the BDB-Genomics ATAC-seq pipeline. Starting from a single metadata CSV exported by those tools, the bridge infers sample conditions and replicates, builds a pipeline-ready `config_geo.yaml` (a copy of `config.yaml` with the `global.samples` field pointing at the new sample sheet), and optionally downloads every SRA run and converts it to paired-end FASTQ. The result is a fully configured project directory that can be handed directly to `snakemake`.
+
+## Input CSV format
+
+The bridge accepts comma- or tab-delimited CSVs. Column names are detected automatically and matched case-insensitively. The following columns are recognised:
+
+| Column name(s) | Required | Description |
+|---|---|---|
+| `Sample_ID`, `Sample_Name`, or `sample` | ✅ Yes | Unique sample identifier used as the pipeline wildcard |
+| `SRR`, `Run`, or `SRR_ID` | ✅ Yes | SRA run accession(s) to download |
+| `SRR_AWS_URL` or `aws_url` | No | Direct S3 URL for faster download via the SRA AWS mirror |
+| `Title` | No | Free-text sample title used for condition/replicate inference |
+| `GSE_ID` | No | GEO series accession (metadata only, not used at runtime) |
+| `GSM_ID` | No | GEO sample accession (metadata only, not used at runtime) |
+
+A single `Sample_ID` may appear on multiple rows (one row per SRR run). The bridge merges all runs for a sample into a single pair of FASTQ files.
+
+## Condition and replicate inference
+
+The bridge calls `infer_metadata(sample_id, title)` on every row. It searches the concatenated `Title` and `Sample_ID` strings using case-insensitive pattern matching:
+
+**Replicate number** — extracted by the regex `(?:rep|replicate)[_-]?(\d+)`. If no match is found, replicate defaults to `1`.
+
+**Condition** — assigned by keyword scanning in priority order:
+
+<Tabs>
+  <Tab title="Control keywords">
+    `control`, `ctrl`, `wildtype`, `wt`, `untreated`, `mock`, `input`, `naive`
+
+    Any match assigns `condition = "control"`.
+  </Tab>
+  <Tab title="Treated keywords">
+    `treated`, `knockout`, `ko`, `tg`, `transgenic`, `mutant`, `mut`, `stimulated`, `stim`
+
+    Any match assigns `condition = "treated"`.
+  </Tab>
+  <Tab title="Default">
+    If neither list matches, `condition = "GEO_sample"`. You can rename this in the generated `samples_geo.tsv` before running the pipeline.
+  </Tab>
+</Tabs>
+
+## Usage
+
+<Steps>
+
+### Prepare your metadata CSV
+
+Export the metadata CSV from GEOAgent or bioStream. Ensure it contains at minimum the `Sample_ID` (or `Sample_Name`) and `SRR` (or `Run`) columns. Save it somewhere accessible, e.g., `path/to/ATAC_meta.csv`.
+
+### Generate config and sample sheet (no download)
+
+```bash
+python3 rules/scripts/geo_agent_bridge.py path/to/ATAC_meta.csv
+```
+
+This writes two files:
+- **`config_geo.yaml`** — a copy of `config.yaml` with `global.samples` overridden to point at the new sample sheet
+- **`data/fastp/samples_geo.tsv`** — the pipeline sample sheet with inferred `replicate` and `condition` columns
+
+FASTQ paths in the sample sheet are set to where the bridge *expects* files to be placed (`data/fastq/<sample_id>_R1.fastq` / `_R2.fastq`). You can populate those paths manually or proceed to the next step to download them automatically.
+
+### Generate config + download SRA FASTQs
+
+```bash
+python3 rules/scripts/geo_agent_bridge.py path/to/ATAC_meta.csv --download
+```
+
+With `--download` the bridge:
+1. Downloads each SRR via the `SRR_AWS_URL` column if present (using `wget` then `curl` as fallback)
+2. Falls back to `prefetch` + `fasterq-dump` (or `fastq-dump`) from SRA-tools if no AWS URL is available
+3. Merges multiple runs for the same sample using binary concatenation
+4. Cleans up intermediate `.sra` files automatically to save disk space
+
+<Note>
+SRA-tools (`prefetch`, `fasterq-dump`) must be installed and on `$PATH` if you are not supplying `SRR_AWS_URL` values. The bridge checks for each tool with `shutil.which()` before attempting the download.
+</Note>
+
+### Review the generated files
+
+```bash
+# Inspect the sample sheet
+cat data/fastp/samples_geo.tsv
+
+# Spot-check the config override
+head -20 config_geo.yaml
+```
+
+Verify that the `condition` and `replicate` assignments match your experimental design. Edit `data/fastp/samples_geo.tsv` directly if any assignments need correcting — the TSV is a plain tab-delimited file.
+
+### Run the pipeline with the generated config
+
+```bash
+snakemake --configfile config_geo.yaml --use-conda --cores 8
+```
+
+The `--configfile` flag merges `config_geo.yaml` on top of the base `config.yaml`, so only the `global.samples` key is overridden. All other tool parameters, resource limits, and reference paths remain exactly as defined in `config.yaml`.
+
+</Steps>
+
+## CLI reference
+
+```bash
+python3 rules/scripts/geo_agent_bridge.py --help
+```
+
+| Flag | Default | Description |
+|---|---|---|
+| `meta_csv` | *(positional)* | Path to the GEOAgent / bioStream metadata CSV |
+| `--fastq-dir` | `data/fastq` | Directory where FASTQ files are saved / expected |
+| `--sra-dir` | `data/sra` | Temporary directory for intermediate `.sra` files |
+| `--out-samples` | `data/fastp/samples_geo.tsv` | Output sample sheet path |
+| `--out-config` | `config_geo.yaml` | Output config YAML path |
+| `--download` | `false` | Download and extract SRA files automatically |
+
+## Zenodo publishing
+
+After a successful pipeline run, you can archive and publish the results to Zenodo using the included deposit script.
+
+<Tabs>
+  <Tab title="Sandbox (test)">
+    ```bash
+    export ZENODO_TOKEN="your_sandbox_token_here"
+    python3 rules/scripts/zenodo_deposit.py
+    ```
+
+    Uploads a draft deposition to [sandbox.zenodo.org](https://sandbox.zenodo.org) — safe for testing. The draft is not publicly visible and does not mint a real DOI.
+  </Tab>
+  <Tab title="Production">
+    ```bash
+    export ZENODO_TOKEN="your_production_token_here"
+    python3 rules/scripts/zenodo_deposit.py --production
+    ```
+
+    Uploads to [zenodo.org](https://zenodo.org). The deposition is created as a **draft** and must be reviewed before publishing.
+  </Tab>
+  <Tab title="Auto-publish">
+    ```bash
+    python3 rules/scripts/zenodo_deposit.py --production --publish
+    ```
+
+    Adds an interactive confirmation prompt then publishes immediately. **This action is irreversible** — once published, a DOI is minted and the record cannot be deleted.
+  </Tab>
+</Tabs>
+
+The script automatically reads `title`, `version`, `keywords`, `abstract`, `license`, and `authors` from `CITATION.cff`, packages the repository via `git archive`, and uploads the resulting zip to Zenodo's bucket API.
+
+<Warning>
+Your token must have the `deposit:write` and `deposit:actions` scopes. Generate sandbox tokens at [sandbox.zenodo.org/account/settings/applications](https://sandbox.zenodo.org/account/settings/applications/) and production tokens at [zenodo.org/account/settings/applications](https://zenodo.org/account/settings/applications/).
+</Warning>

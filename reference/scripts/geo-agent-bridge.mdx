@@ -1,0 +1,152 @@
+---
+title: "geo_agent_bridge.py: GEOAgent Metadata Import CLI Reference"
+sidebarTitle: "geo-agent-bridge"
+description: "CLI reference for geo_agent_bridge.py — bridges GEOAgent/bioStream ATAC-seq metadata CSVs to a BDB pipeline-ready config and sample sheet, with optional SRA download."
+---
+
+`geo_agent_bridge.py` connects GEOAgent or bioStream metadata exports directly to the BDB-Genomics ATAC-seq pipeline. Given a metadata CSV that describes GEO samples and their associated SRR accessions, the script infers conditions, replicates, and FASTQ paths; writes a pipeline-ready TSV sample sheet; and generates a `config_geo.yaml` config file that inherits all settings from the base `config.yaml` with only `global.samples` overridden to point at the generated sample sheet. If the `--download` flag is passed, it also fetches and extracts SRA FASTQ files automatically.
+
+```bash
+python3 rules/scripts/geo_agent_bridge.py <csv_path> [--download]
+```
+
+---
+
+## Arguments
+
+<ParamField path="csv_path" type="string" required>
+  Path to the GEOAgent or bioStream metadata CSV file (positional argument). Accepts comma or tab-delimited files — the delimiter is auto-detected using Python's `csv.Sniffer`. Column names are stripped of surrounding whitespace before parsing.
+</ParamField>
+
+<ParamField path="--download" type="boolean" default="false">
+  When supplied, the script downloads SRA data and extracts paired FASTQ files for each sample before writing the sample sheet. Download proceeds via:
+  1. `wget` or `curl` from the `SRR_AWS_URL` column if present.
+  2. Fallback to `prefetch` (SRA toolkit) if the AWS URL download fails or the column is absent.
+  3. FASTQ extraction using `fasterq-dump` (preferred) or `fastq-dump`.
+
+  When omitted, the script writes FASTQ paths assuming files are already present locally, using the SRR accession-based filename convention (`{SRR}_1.fastq`, `{SRR}_2.fastq`) or sample ID convention (`{sample_id}_R1.fastq`, `{sample_id}_R2.fastq`).
+</ParamField>
+
+<ParamField path="--fastq-dir" type="string" default="data/fastq">
+  Directory where downloaded FASTQ files are saved. Created automatically if it does not exist.
+</ParamField>
+
+<ParamField path="--sra-dir" type="string" default="data/sra">
+  Directory for temporary intermediate SRA archive files. Intermediate `.sra` files are deleted after successful FASTQ extraction to conserve disk space.
+</ParamField>
+
+<ParamField path="--out-samples" type="string" default="data/fastp/samples_geo.tsv">
+  Output path for the generated TSV sample sheet. Parent directories are created automatically.
+</ParamField>
+
+<ParamField path="--out-config" type="string" default="config_geo.yaml">
+  Output path for the generated pipeline config YAML. The base `config.yaml` is loaded first, and only `global.samples` is overridden to point at `--out-samples`.
+</ParamField>
+
+---
+
+## Input CSV Columns
+
+The following column names are recognised. Column matching is case-sensitive and whitespace-stripped.
+
+| Column name(s) | Required | Description |
+|---|---|---|
+| `Sample_ID`, `Sample_Name`, or `sample` | Yes | Unique sample identifier. The first non-null value among these three is used. |
+| `SRR`, `Run`, or `SRR_ID` | Yes | SRA run accession (e.g., `SRR12345678`). Multiple SRRs per sample are automatically merged. |
+| `SRR_AWS_URL` or `aws_url` | No | Direct HTTP(S) URL to the SRA file on AWS S3. Used by `--download` as the primary download source. |
+| `Title` | No | Free-text sample description. Used by the condition/replicate inference heuristic. |
+| `GSE_ID` | No | GEO Series accession. Stored in the bridge's internal metadata but not written to the sample sheet. |
+| `GSM_ID` | No | GEO Sample accession. Stored internally but not written to the sample sheet. |
+
+<Note>
+Rows that have no `Sample_ID` or no `SRR` value are silently skipped. Multiple rows with the same `Sample_ID` are merged into one sample entry with multiple SRR runs — the FASTQ files from those runs are concatenated (merged with `shutil.copyfileobj`) into a single R1 and R2 file.
+</Note>
+
+---
+
+## Condition and Replicate Inference
+
+The bridge automatically infers `condition` and `replicate` values for each sample from its `Title` and `Sample_ID` strings. This removes the need to manually populate those columns before running the pipeline.
+
+**Replicate inference:** A regex search for `rep[licate][_-]?(\d+)` (case-insensitive) in `Title + "_" + Sample_ID`. If a match is found, the captured integer is used; otherwise the replicate defaults to `1`.
+
+**Condition inference:** The combined `Title + "_" + Sample_ID` string is lowercased and searched for keyword lists in order:
+
+1. **Control keywords** (matched first): `control`, `ctrl`, `wildtype`, `wt`, `untreated`, `mock`, `input`, `naive` → condition set to `"control"`
+2. **Treated keywords**: `treated`, `knockout`, `ko`, `tg`, `transgenic`, `mutant`, `mut`, `stimulated`, `stim` → condition set to `"treated"`
+3. **Default (no keyword match):** condition set to `"GEO_sample"`
+
+<Tip>
+If the auto-inferred conditions are incorrect for your dataset, you can edit the generated `data/fastp/samples_geo.tsv` directly before running the pipeline — the file is a plain tab-separated text file.
+</Tip>
+
+---
+
+## Outputs
+
+### Sample Sheet (`--out-samples`)
+
+A tab-separated TSV file conforming to the BDB pipeline's required format:
+
+```tsv
+sample	fastq_r1	fastq_r2	replicate	condition
+GSM123456	data/fastq/GSM123456_R1.fastq	data/fastq/GSM123456_R2.fastq	1	control
+GSM123457	data/fastq/GSM123457_R1.fastq	data/fastq/GSM123457_R2.fastq	2	control
+```
+
+FASTQ paths are written as relative paths from the current working directory.
+
+### Config File (`--out-config`)
+
+A complete `config.yaml`-compatible YAML file with `global.samples` pointing at the generated sample sheet. All other settings inherit from `config.yaml` if it is present in the current working directory.
+
+```yaml
+global:
+  samples: data/fastp/samples_geo.tsv
+  # ... all other global.* settings inherited from config.yaml
+fastp:
+  # ... unchanged from config.yaml
+# ... all other tool blocks unchanged
+```
+
+---
+
+## Running the Pipeline After Import
+
+Once the bridge has completed, launch the pipeline with the generated config:
+
+```bash
+snakemake --configfile config_geo.yaml --use-conda --cores 8
+```
+
+Or use the `run_batched.py` script for low-resource environments:
+
+```bash
+python3 rules/scripts/run_batched.py \
+  --batch-size 2 \
+  --cores 4 \
+  --config config_geo.yaml \
+  --sample-sheet data/fastp/samples_geo.tsv
+```
+
+---
+
+## Full Workflow Example
+
+```bash
+# Step 1: Export metadata from GEOAgent
+# (produces ATAC_meta.csv with Sample_ID, SRR, Title, GSE_ID columns)
+
+# Step 2: Run the bridge with automatic SRA download
+python3 rules/scripts/geo_agent_bridge.py ATAC_meta.csv --download
+
+# Step 3: Validate the generated config
+python3 rules/scripts/validate_config.py config_geo.yaml
+
+# Step 4: Run the pipeline
+snakemake --configfile config_geo.yaml --use-conda --cores 16
+```
+
+<Warning>
+The `--download` flag requires the SRA toolkit (`prefetch`, `fasterq-dump`) to be installed and on the system `PATH`. For large datasets, ensure sufficient disk space in `--sra-dir` and `--fastq-dir` before running. Intermediate `.sra` files are automatically deleted after extraction, but the peak disk usage is approximately 2× the final FASTQ size.
+</Warning>

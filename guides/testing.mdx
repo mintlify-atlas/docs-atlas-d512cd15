@@ -1,0 +1,176 @@
+---
+title: "Testing the BDB-Genomics ATAC-seq Pipeline"
+sidebarTitle: "Testing"
+description: "Two testing strategies for the pipeline: synthetic CI data generated locally in seconds, and real ENCODE data downloaded for full-scale validation."
+---
+
+The BDB-Genomics ATAC-seq pipeline ships with two complementary testing strategies. The **synthetic CI path** requires no internet access and completes in minutes — it is the approach used by GitHub Actions on every push and pull request. The **real ENCODE path** downloads approximately 200 MB of publicly available data from ENCODE, GENCODE, and JASPAR, and exercises the full pipeline against biologically authentic reads. Choose synthetic data for rapid iteration during development and real data for pre-release validation.
+
+## Synthetic CI data
+
+The script `rules/scripts/generate_test_data.py` builds a complete, self-contained dataset entirely in memory and writes it to the `data/` directory. No network connection, SRA-tools, or pre-existing reference files are required.
+
+### What gets generated
+
+Running the script produces the following artefacts in seven steps:
+
+<CardGroup cols={2}>
+  <Card title="Reference genome (FASTA)" icon="dna">
+    A three-chromosome genome (`chr1`: 500 kbp, `chr2`: 250 kbp, `chrMT`: 16,569 bp) written to `data/reference/genome.fa` with a companion `.fai` index.
+  </Card>
+  <Card title="Chromosome sizes" icon="ruler">
+    `data/reference/genome.chrom.sizes` — required by `bedGraphToBigWig` and `deeptools`.
+  </Card>
+  <Card title="Gene annotation (GTF)" icon="file-code">
+    80 genes (50 on `chr1`, 30 on `chr2`) with gene, transcript, and exon entries written to `data/reference/annotation.gtf`.
+  </Card>
+  <Card title="ENCODE blacklist BED" icon="ban">
+    A two-region blacklist (`data/reference/ENCODE_blacklist.bed`) covering known repeat-dense intervals.
+  </Card>
+  <Card title="Bowtie2 index" icon="magnifying-glass">
+    Built via `bowtie2-build` if available on `$PATH`; otherwise, valid placeholder `.bt2` binary files are written to `data/reference/index/`.
+  </Card>
+  <Card title="Paired-end FASTQs" icon="file">
+    Four samples (`sample1`–`sample4`) × 7,500 read pairs each, written as gzip-compressed FASTQ to `data/fastq/`. 75% of reads are positioned within ±2,000 bp of a TSS to guarantee non-zero TSS enrichment scores.
+  </Card>
+</CardGroup>
+
+The TSS-targeting logic is critical: `tss_enrichment.R` calls `featureAlignedSignal()` which tiles each TSS into a ±2,000 bp window divided into 200 bins. Without sufficient coverage across those bins the R function crashes with a names/length mismatch. By targeting 75% of reads near annotated TSSes across 80 genes, the synthetic data reliably passes this QC gate.
+
+### Generate and run
+
+```bash
+# Generate all synthetic data (takes ~10–30 seconds)
+python3 rules/scripts/generate_test_data.py
+
+# Run the full pipeline against synthetic data
+snakemake --use-conda --cores 4
+```
+
+### Run with the test profile
+
+The `profile/test/` profile relaxes QC thresholds to values appropriate for tiny synthetic datasets, reduces default resource requests, and enables verbose shell output:
+
+```bash
+snakemake --profile profile/test --use-conda --cores 4
+```
+
+The profile sets the following Snakemake options (`profile/test/config.yaml`):
+
+```yaml
+use-conda: true
+jobs: 4
+printshellcmds: true
+show-failed-logs: true
+rerun-incomplete: true
+restart-times: 0
+configfile: "profile/test/config_test.yaml"
+
+default-resources:
+  mem_mb: 2000
+  time: 30
+  threads: 2
+```
+
+The `configfile` key points to `profile/test/config_test.yaml`, which overrides the `qc_gate` thresholds so synthetic datasets are not incorrectly flagged as failures:
+
+```yaml
+qc_gate:
+  params:
+    min_frip: 0.0
+    min_tss_enr: 0.0
+    min_mapping_rate: 0.0
+    max_duplicate_rate: 100.0
+```
+
+<Tip>
+During rule development, run `snakemake --profile profile/test --use-conda --cores 4 --until <your_rule>` to execute only the rules up to and including your new rule, without waiting for the full DAG to complete.
+</Tip>
+
+---
+
+## Real ENCODE data
+
+For full-scale validation against real sequencing data, use the download script:
+
+```bash
+bash rules/scripts/download_real_data.sh
+```
+
+<Warning>
+This script downloads approximately **200 MB** of data and requires `wget`, `bowtie2-build`, and optionally `chromap` on `$PATH`. Ensure you have a stable internet connection before running.
+</Warning>
+
+### What gets downloaded
+
+| Resource | Source | Destination |
+|---|---|---|
+| ENCSR356KRQ FASTQs (chr19 + chrM subsampled) | ENCODE Google Storage | `data/fastq/sample{1,2,3}_R{1,2}.fastq.gz` |
+| hg38 chr19 FASTA | UCSC Golden Path | `data/reference/genome.fa` (merged with chrM) |
+| hg38 chrM FASTA | UCSC Golden Path | merged into `data/reference/genome.fa` |
+| GENCODE v44 basic GTF | EMBL-EBI / Ensembl | `data/reference/annotation.gtf` (chr19 + chrM only) |
+| ENCODE blacklist (ENCFF356LFX) | ENCODE Project | `data/reference/ENCODE_blacklist.bed` (chr19 + chrM) |
+| JASPAR 2024 vertebrate motifs | JASPAR ELIXIR | `data/motifs/jaspar_vertebrates.meme` |
+
+After downloading, the script:
+1. Combines `chr19.fa` and `chrM.fa` into a single `genome.fa`
+2. Extracts only `chr19` and `chrM` lines from the GENCODE GTF
+3. Filters the blacklist BED to those same chromosomes
+4. Writes `genome.chrom.sizes` (`chr19: 58,617,616 bp`, `chrM: 16,569 bp`)
+5. Builds a Bowtie2 index with `bowtie2-build`
+6. Attempts to build a Chromap index if `chromap` is available
+
+### Run the full pipeline
+
+```bash
+snakemake --use-conda --cores 8
+```
+
+This uses the default `config.yaml` thresholds, including the QC gate (`min_frip: 0.2`, `min_tss_enr: 7.0`, `min_mapping_rate: 80.0`, `max_duplicate_rate: 20.0`). Real ENCODE data should pass all four gates.
+
+---
+
+## CI/CD with GitHub Actions
+
+The repository's continuous integration pipeline is defined in `.github/workflows/lint.yml` and runs on every push and pull request to `main`.
+
+### Workflow structure
+
+The workflow has two sequential jobs:
+
+<CardGroup cols={2}>
+  <Card title="lint" icon="check">
+    Runs `validate_config.py`, `snakemake --lint`, and `pytest rules/scripts/test_validate_config.py` to catch config errors and rule syntax issues before any computation starts.
+  </Card>
+  <Card title="test" icon="flask">
+    Depends on `lint`. Generates synthetic data and executes `snakemake --use-conda --conda-frontend mamba --profile profile/test --cores 4`. Results and logs are uploaded as GitHub Actions artifacts (retained 7 days).
+  </Card>
+</CardGroup>
+
+Both jobs use **Micromamba** (via `mamba-org/setup-micromamba@v1`) instead of the standard `conda` frontend for significantly faster environment solve and install times. Conda environments are cached by a hash of all `rules/envs/**/*.yaml` files, so unchanged environments are restored from cache rather than rebuilt.
+
+### Running the test suite locally
+
+To reproduce the CI checks on your own machine:
+
+```bash
+# Install test dependencies
+pip install "snakemake>=8.0,<9.0" pyyaml "pulp>=2.0,<2.8" pytest
+
+# 1. Validate config structure (100+ assertions)
+pytest rules/scripts/test_validate_config.py
+
+# 2. Snakemake's built-in linter
+snakemake --lint
+
+# 3. Dry-run with the test profile (no actual execution)
+snakemake -n --use-conda --profile profile/test
+
+# 4. Full synthetic data run
+python3 rules/scripts/generate_test_data.py
+snakemake --use-conda --cores 4 --profile profile/test
+```
+
+<Note>
+`test_validate_config.py` contains over 100 pytest assertions covering required keys, value types, resource floor values, path consistency, and YAML anchor resolution. It runs in under a second and catches the most common configuration mistakes before any Snakemake rules are evaluated.
+</Note>

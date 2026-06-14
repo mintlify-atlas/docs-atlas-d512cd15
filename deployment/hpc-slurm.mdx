@@ -1,0 +1,215 @@
+---
+title: "Running the ATAC-seq Pipeline on SLURM HPC Clusters"
+sidebarTitle: "HPC / SLURM"
+description: "Submit BDB-Genomics ATAC-seq jobs to SLURM using the built-in profile, with per-rule resource overrides, automatic restarts, and job monitoring."
+---
+
+The BDB-Genomics ATAC-seq pipeline ships a ready-made SLURM profile at `profile/slurm/config.yaml` that maps every Snakemake rule to a SLURM batch job automatically. You do not need to write any `sbatch` scripts. Snakemake reads the per-rule `resources` blocks declared in `config.yaml` and translates them directly into SLURM `--mem`, `--time`, and `--partition` flags. The profile supports up to 100 concurrent jobs, automatic retry on transient failures, and structured failure logging.
+
+---
+
+## Profile Configuration
+
+```yaml
+# profile/slurm/config.yaml
+
+executor: slurm
+use-conda: true
+jobs: 100
+printshellcmds: true
+show-failed-logs: true
+keep-going: true
+rerun-incomplete: true
+restart-times: 1
+
+latency-wait: 60
+
+default-resources:
+  mem_mb: 4000
+  time: 60
+  threads: 1
+  slurm_partition: "standard"
+  slurm_account: "bdb_genomics"
+```
+
+| Setting | Value | Effect |
+|---|---|---|
+| `executor` | `slurm` | Use the Snakemake SLURM executor plugin |
+| `jobs` | `100` | Maximum concurrent SLURM jobs |
+| `latency-wait` | `60` | Seconds to wait for output files to appear on shared filesystems |
+| `restart-times` | `1` | Automatically resubmit a failed job once before marking it failed |
+| `keep-going` | `true` | Continue running other samples when one sample's job fails |
+| `rerun-incomplete` | `true` | Re-run jobs whose output files are incomplete from a previous run |
+| `slurm_partition` | `standard` | Default SLURM partition (queue) |
+| `slurm_account` | `bdb_genomics` | SLURM accounting group |
+
+---
+
+## Running the Pipeline
+
+```bash
+snakemake --profile profile/slurm
+```
+
+For scATAC mode, prepend the environment variable:
+
+```bash
+ATAC_MODE=scatac snakemake --profile profile/slurm
+```
+
+Snakemake submits each rule as an independent SLURM job. Rules with per-rule resource blocks in `config.yaml` use those values; all other rules fall back to the `default-resources` declared in the profile.
+
+---
+
+## Per-Rule Resource Overrides
+
+Resource limits in `config.yaml` are automatically respected by the SLURM executor. Memory-intensive rules request more RAM; quick bookkeeping rules stay well within the defaults:
+
+```yaml
+# config.yaml — high-memory rules request dedicated resources
+bowtie2:
+  threads: 8
+  resources:
+    mem_mb: 16000   # 16 GB — overrides the 4 GB default
+    time: 240       # 4 hours
+
+macs2:
+  threads: 8
+  resources:
+    mem_mb: 16000
+    time: 240
+
+differential_accessibility:
+  threads: 8
+  resources:
+    mem_mb: 16000
+    time: 240
+
+# Low-overhead rules stay within default limits
+qc_gate:
+  threads: 1
+  resources:
+    mem_mb: 1000
+    time: 10
+
+frip_calculation:
+  threads: 4
+  resources:
+    mem_mb: 2000
+    time: 15
+```
+
+<Tip>
+You never need to edit `profile/slurm/config.yaml` to change per-rule resources. Set them in `config.yaml` and the SLURM executor picks them up automatically.
+</Tip>
+
+---
+
+## Customising Partition and Account
+
+Most HPC sites use site-specific partition names and accounting groups. Edit the `default-resources` block in `profile/slurm/config.yaml` to match your cluster:
+
+```yaml
+# profile/slurm/config.yaml
+default-resources:
+  mem_mb: 4000
+  time: 60
+  threads: 1
+  slurm_partition: "high_mem"        # ← your partition name
+  slurm_account: "lab_allocation"    # ← your allocation account
+```
+
+To override the partition for a specific rule only (without modifying the profile), add the resource directly to that rule's block in `config.yaml`:
+
+```yaml
+# config.yaml
+archr:
+  resources:
+    mem_mb: 64000
+    time: 240
+    slurm_partition: "bigmem"        # ← rule-specific partition override
+```
+
+---
+
+## Handling Transient Failures
+
+SLURM jobs can fail for reasons unrelated to the pipeline (node preemption, filesystem timeouts, memory allocation races). The profile sets `restart-times: 1` so Snakemake automatically resubmits a failed job once. If it fails a second time, Snakemake marks the rule as definitively failed and — because `keep-going: true` is set — continues processing all other samples.
+
+```yaml
+# profile/slurm/config.yaml
+restart-times: 1   # resubmit once on transient failure
+keep-going: true   # do not halt the whole pipeline for one failed sample
+```
+
+---
+
+## Monitoring Jobs
+
+<Tabs>
+  <Tab title="squeue">
+    Check the status of all running and pending jobs submitted by your account:
+    ```bash
+    squeue -u $USER
+    ```
+    Filter to jobs with "snakemake" in the name:
+    ```bash
+    squeue -u $USER --name snakemake
+    ```
+  </Tab>
+  <Tab title="sacct">
+    Review completed job accounting data including CPU efficiency and peak memory:
+    ```bash
+    sacct -u $USER --format=JobID,JobName,State,CPUTime,MaxRSS,Elapsed
+    ```
+  </Tab>
+  <Tab title="Snakemake logs">
+    Snakemake writes per-rule logs to `logs/{rule}/{sample}.err`. The `show-failed-logs: true` profile setting automatically prints the contents of any failed log to the terminal:
+    ```bash
+    # Manually inspect a failed log
+    cat logs/bowtie2/SRR_ctrl_rep1.err
+    ```
+    To stream Snakemake's own console output while jobs are running:
+    ```bash
+    snakemake --profile profile/slurm 2>&1 | tee snakemake_run.log
+    ```
+  </Tab>
+</Tabs>
+
+---
+
+## Resuming a Partial Run
+
+If the pipeline is interrupted, restart with the same command. The `rerun-incomplete: true` setting ensures Snakemake identifies and re-runs any rules whose output files are partial or missing, without re-running rules that completed successfully:
+
+```bash
+snakemake --profile profile/slurm
+```
+
+---
+
+## Dry Run Before Submission
+
+Preview the full DAG and resource requirements before submitting to the queue:
+
+```bash
+snakemake --profile profile/slurm --dry-run
+```
+
+This prints every job that would be submitted, its requested memory and time, and the dependency order — without actually calling `sbatch`.
+
+---
+
+## Structured Execution Summary
+
+On completion or failure the pipeline writes a JSON execution summary:
+
+```
+results/reporting/pipeline_execution_summary.json
+```
+
+This file captures per-rule CPU time, peak memory, and — on failure — the last five error lines from the corresponding log file in `logs/`. The `benchmarks/` directory contains full per-job resource consumption records written by Snakemake's built-in benchmarking.
+
+<Note>
+The structured JSON summary is generated by `rules/scripts/aggregate_logs.py`, which is called automatically in the Snakefile `onsuccess` and `onerror` lifecycle hooks. No manual invocation is required.
+</Note>

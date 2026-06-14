@@ -1,0 +1,292 @@
+---
+title: "Low-Resource and Memory-Constrained Deployment Guide"
+sidebarTitle: "Low-Resource"
+description: "Run the BDB-Genomics ATAC-seq pipeline on machines with ≤8 GB RAM using the low_resource profile and run_batched.py sequential sample batching."
+---
+
+The BDB-Genomics ATAC-seq pipeline is designed to scale down to workstations and laptops with limited RAM. Two complementary mechanisms control memory usage: the `profile/low_resource` profile caps the memory each individual rule can request, and `rules/scripts/run_batched.py` serialises sample processing so that only a small subset of samples is active in memory at any given time. Used together, these tools make it possible to run the full pipeline on a machine with as little as 4 GB of RAM, at the cost of longer elapsed wall time.
+
+---
+
+## The `low_resource` Profile
+
+The low-resource profile lives at `profile/low_resource/config.yaml`. It sets `jobs: 2` so at most two rules run concurrently, applies explicit per-rule memory and thread caps via `set-resources`, and falls back to 2 GB and 1 thread for any rule not explicitly listed.
+
+### Profile Configuration
+
+```yaml
+# profile/low_resource/config.yaml
+
+use-conda: true
+jobs: 2
+printshellcmds: true
+show-failed-logs: true
+keep-going: true
+rerun-incomplete: true
+restart-times: 0
+latency-wait: 30
+
+set-resources:
+  bowtie2_align:
+    mem_mb: 4000
+    threads: 2
+
+  samtools_sort:
+    mem_mb: 3000
+    threads: 2
+
+  samtools_markdup:
+    mem_mb: 4000
+    threads: 2
+
+  tn5_shift:
+    mem_mb: 3000
+    threads: 2
+
+  macs2_peak_calling:
+    mem_mb: 4000
+    threads: 2
+
+  tss_enrichment:
+    mem_mb: 4000
+    threads: 2
+
+  heatmap:
+    mem_mb: 4000
+    threads: 2
+
+  peak_annotation:
+    mem_mb: 4000
+    threads: 2
+
+  motif_analysis:
+    mem_mb: 4000
+    threads: 2
+
+  differential_accessibility:
+    mem_mb: 4000
+    threads: 2
+
+  chromvar_analysis:
+    mem_mb: 4000
+    threads: 2
+
+  footprinting:
+    mem_mb: 4000
+    threads: 2
+
+  tobias_atacorrect:
+    mem_mb: 4000
+    threads: 2
+
+  tobias_score_bigwig:
+    mem_mb: 4000
+    threads: 2
+
+  tobias_bindetect:
+    mem_mb: 4000
+    threads: 2
+
+  correlation_analysis:
+    mem_mb: 3000
+    threads: 2
+
+  normalized_coverage:
+    mem_mb: 3000
+    threads: 2
+
+  preseq:
+    mem_mb: 2000
+    threads: 1
+
+  qualimap_bamqc:
+    mem_mb: 3000
+    threads: 2
+
+  consensus_peaks:
+    mem_mb: 3000
+    threads: 2
+
+  fastp_trim:
+    mem_mb: 3000
+    threads: 2
+
+  qc_gate:
+    mem_mb: 1000
+    threads: 1
+
+  multiqc:
+    mem_mb: 2000
+    threads: 1
+
+# Fallback for any rule not listed above
+default-resources:
+  mem_mb: 2000
+  time: 120
+  threads: 1
+```
+
+### Running with the Low-Resource Profile
+
+```bash
+snakemake --profile profile/low_resource
+```
+
+For scATAC mode:
+
+```bash
+ATAC_MODE=scatac snakemake --profile profile/low_resource
+```
+
+<Note>
+The `set-resources` overrides in the low-resource profile take precedence over the (higher) values declared in `config.yaml`. This is intentional — the profile enforces a hard ceiling regardless of what each rule's default resources request.
+</Note>
+
+---
+
+## Sequential Sample Batching with `run_batched.py`
+
+Even with the low-resource profile, processing all samples simultaneously can cause out-of-memory (OOM) errors on machines with ≤4 GB RAM. `rules/scripts/run_batched.py` solves this by reading the sample sheet, splitting it into groups of `--batch-size` samples, and executing Snakemake sequentially for each group. Because Snakemake resumes automatically from completed outputs, results accumulate in `results/` across batches without any duplication.
+
+### How It Works
+
+```
+Sample sheet → Split into batches of N
+    Batch 1: [sample_A, sample_B]  → snakemake (runs, completes)
+    Batch 2: [sample_C, sample_D]  → snakemake (resumes, runs, completes)
+    ...
+    Final:                         → snakemake --target multiqc_report.html
+```
+
+Each batch invocation passes the specific per-sample target files (fastp trimmed reads, BAMs, peaks, QC gate outputs, BigWigs) as explicit Snakemake targets. This restricts the active DAG to only those samples, preventing Snakemake from materialising intermediate files for the full dataset simultaneously.
+
+### Arguments
+
+| Argument | Default | Description |
+|---|---|---|
+| `--batch-size` | `1` | Number of samples processed per Snakemake invocation |
+| `--cores` | `2` | CPU cores allocated to each batch |
+| `--memory` | `4000` | Memory limit in MB passed via `--resources mem_mb=` |
+| `--mode` | from config | Pipeline mode: `bulk` or `scatac` |
+| `--config` | `config.yaml` | Path to the main config file |
+| `--sample-sheet` | `data/fastp/samples.tsv` | Path to the sample TSV |
+| `--conda-frontend` | `mamba` | Conda solver: `mamba` or `conda` |
+| `--dry-run` | flag | Print batch plan without executing |
+
+### Basic Usage
+
+```bash
+# Process two samples at a time, 8 cores, using the low_resource profile
+python3 rules/scripts/run_batched.py --batch-size 2 --cores 8 --profile profile/local
+```
+
+```bash
+# Ultra-low memory: one sample at a time, 2 cores, 4 GB cap
+python3 rules/scripts/run_batched.py --batch-size 1 --cores 2 --memory 4000
+```
+
+```bash
+# scATAC mode batching
+python3 rules/scripts/run_batched.py \
+  --batch-size 1 \
+  --cores 4 \
+  --memory 8000 \
+  --mode scatac
+```
+
+### Dry Run — Preview the Batch Plan
+
+Inspect how the sample sheet will be divided into batches before committing to a run:
+
+```bash
+python3 rules/scripts/run_batched.py --batch-size 2 --cores 8 --dry-run
+```
+
+Output:
+
+```
+Total samples: 6
+Batch size: 2
+Total batches: 3
+Cores per batch: 8
+Memory limit: 4000 MB
+Mode: bulk
+
+Batches (dry-run):
+  Batch 1: SRR_ctrl_rep1, SRR_ctrl_rep2
+  Batch 2: SRR_treat_rep1, SRR_treat_rep2
+  Batch 3: SRR_rescue_rep1, SRR_rescue_rep2
+```
+
+---
+
+## Combining the Low-Resource Profile with Batching
+
+For machines with ≤4 GB of RAM, use the low-resource profile **and** the batching script together. The profile caps per-rule memory; the batching script prevents multiple high-memory rules from running for different samples simultaneously:
+
+```bash
+python3 rules/scripts/run_batched.py \
+  --batch-size 1 \
+  --cores 2 \
+  --memory 4000 \
+  --conda-frontend conda
+```
+
+The script automatically passes `--profile profile/low_resource` and `--resources mem_mb=4000` to each Snakemake invocation. You do not need to pass the profile flag separately.
+
+<Warning>
+Do not set `--batch-size` higher than 2 on machines with ≤4 GB RAM. Each additional concurrent sample can add 2–4 GB of peak memory during Bowtie2 alignment and MACS2 peak calling.
+</Warning>
+
+---
+
+## Choosing the Right Configuration
+
+<CardGroup cols={2}>
+  <Card title="≤4 GB RAM" icon="memory">
+    Use `--batch-size 1 --cores 2 --memory 4000`. One sample runs at a time. Expect significantly longer total run times.
+  </Card>
+  <Card title="8 GB RAM, 4 cores" icon="server">
+    Use `--profile profile/low_resource` with `--batch-size 2 --cores 4`. Two samples run concurrently within the per-rule memory caps.
+  </Card>
+  <Card title="16 GB RAM workstation" icon="desktop">
+    Use `--profile profile/local` directly. The default local profile (`jobs: 8`) handles up to 8 concurrent jobs without memory restrictions.
+  </Card>
+  <Card title="Validating setup" icon="circle-check">
+    Run the test profile first: `snakemake --profile profile/test`. It applies relaxed QC thresholds designed for synthetic CI datasets that complete quickly on any hardware.
+  </Card>
+</CardGroup>
+
+---
+
+## Validating Your Setup Before a Full Run
+
+Before committing to a multi-hour run on limited hardware, generate synthetic test data and execute a dry run to confirm the configuration is valid:
+
+```bash
+# Generate synthetic FASTQ, FASTA, GTF, and Bowtie2 index (no downloads needed)
+python3 rules/scripts/generate_test_data.py
+
+# Dry run with the low_resource profile to verify the DAG
+snakemake --profile profile/low_resource --dry-run
+```
+
+<Tip>
+The test profile (`profile/test`) ships with relaxed QC gate thresholds (`min_frip: 0.0`) specifically so that synthetic reads — which have artificially low FRiP scores — still pass the gate and trigger all downstream rules. Use it for initial setup validation; switch to the default thresholds for real data.
+</Tip>
+
+---
+
+## Monitoring Progress on Low-Resource Machines
+
+On machines without a job scheduler, watch Snakemake's console output directly. The `printshellcmds: true` setting in the low-resource profile echoes every shell command as it runs. For longer runs, redirect output to a log file:
+
+```bash
+python3 rules/scripts/run_batched.py \
+  --batch-size 2 \
+  --cores 4 \
+  --memory 8000 \
+  2>&1 | tee pipeline_run.log
+```
+
+Per-job resource consumption (wall time, CPU time, peak memory) is written to `benchmarks/` after each rule completes and aggregated into `results/reporting/benchmark_summary.tsv` at the end of the run.

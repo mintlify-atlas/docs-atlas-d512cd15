@@ -1,0 +1,213 @@
+---
+title: "Contributing to the BDB-Genomics ATAC-seq Pipeline"
+sidebarTitle: "Contributing"
+description: "How to report bugs, submit pull requests, follow architecture guidelines, publish releases to Zenodo, and properly cite the BDB-Genomics ATAC-seq Framework."
+---
+
+The BDB-Genomics ATAC-seq pipeline is an open-source project and contributions of all kinds are welcome — whether you are fixing a bug in an existing rule, adding support for a new tool, improving documentation, or helping triage issues. The goal of the project is to build the most rigorous, modular standard for epigenomic data processing, and every contribution moves that goal forward. This guide covers how to report problems, submit code changes, follow the architectural conventions that keep the pipeline maintainable, and publish new releases to Zenodo.
+
+## Reporting bugs and feature requests
+
+If you encounter unexpected behaviour, an error message you cannot resolve, or a tool integration you would like to see added, please open a GitHub Issue at [github.com/BDB-Genomics/atacseq-pipeline](https://github.com/BDB-Genomics/atacseq-pipeline).
+
+A good bug report includes:
+
+- The exact error message or unexpected output
+- The relevant section of your `config.yaml`
+- The Snakemake log from `logs/<stage>/<tool>/<sample>.log`
+- A minimal example that reproduces the problem (synthetic data from `generate_test_data.py` is ideal)
+- Your operating system, Snakemake version (`snakemake --version`), and Conda/Mamba version
+
+Before opening a new issue, search existing issues to avoid duplicates.
+
+## Submitting pull requests
+
+<Steps>
+
+### Fork and branch
+
+Fork the repository on GitHub, then create a feature branch from `main`:
+
+```bash
+git checkout main
+git pull upstream main
+git checkout -b feat/my-new-tool
+```
+
+Use descriptive branch names (`feat/`, `fix/`, `docs/`) so reviewers immediately understand the scope of the change.
+
+### Develop in isolation
+
+Every new tool must live in its own `.smk` rule file and its own `.yaml` Conda environment. Do not add new logic to an existing rule file, and do not share Conda environments between rules. Follow the full steps in [Adding a Tool](/guides/adding-a-tool) to wire up the rule, environment, and config block correctly.
+
+```bash
+# New rule file
+rules/my_tool.smk
+
+# New Conda environment (choose the correct stage directory)
+rules/envs/05_peak_calling/my_tool.yaml
+```
+
+### Test your changes
+
+Run the config validation suite and the synthetic data pipeline before opening a PR:
+
+```bash
+# Validate config structure
+pytest rules/scripts/test_validate_config.py
+
+# Snakemake linter
+snakemake --lint
+
+# Dry-run with test profile
+snakemake -n --use-conda --profile profile/test
+
+# Full synthetic run
+python3 rules/scripts/generate_test_data.py
+snakemake --use-conda --cores 4 --profile profile/test
+```
+
+### Open the pull request
+
+Push your branch and open a PR against `main` on GitHub. In the PR description:
+- Explain what the change does and why
+- List any new `config.yaml` keys with their types and default values
+- Link to the relevant GitHub Issue if applicable
+- Note any breaking changes (new required keys, removed outputs, etc.)
+
+</Steps>
+
+## Architecture guidelines
+
+These conventions are enforced in code review. PRs that violate them will be asked to revise before merging.
+
+<Accordion title="Modularity: one tool, one .smk, one .yaml">
+Every tool must have its own Snakemake rule file (`rules/<toolname>.smk`) and its own isolated Conda environment descriptor (`rules/envs/<stage>/<toolname>.yaml`). No rule may embed another tool's logic inline. This policy makes it possible to update, disable, or replace any single step without side effects on the rest of the DAG.
+</Accordion>
+
+<Accordion title="Fail fast: checks before expensive steps">
+Rules must validate their inputs before launching long-running shell commands. If a required input file is missing, a minimum read count is not met, or a preceding QC gate has failed, the rule must exit immediately with a clear error message and a non-zero exit code. This prevents wasted cluster hours on jobs that are guaranteed to fail.
+</Accordion>
+
+<Accordion title="All paths in config.yaml, never hardcoded">
+Every path to an input directory, output directory, reference file, or intermediate file must be declared in `config.yaml` and read from `config[...]` inside the rule. The only string literals permitted inside a `.smk` file are log/benchmark path patterns (which contain `{wildcards}`) and the `conda:` / `container:` directives. Changing a reference path must require editing `config.yaml` only — never touching a rule file.
+</Accordion>
+
+<Accordion title="Resources always from config, scaled by attempt">
+The `mem_mb` and `time` fields in the `resources:` block must be read from `config[...]['resources']` and multiplied by `attempt` (via a lambda) so that Snakemake can automatically retry failed jobs with doubled resources on HPC clusters. Hard-coding `mem_mb: 8000` in a rule is not permitted.
+</Accordion>
+
+---
+
+## Maintainer guidelines: publishing to Zenodo
+
+When cutting a new release, maintainers should deposit the updated pipeline to Zenodo to mint a persistent DOI. There are two supported methods.
+
+### Option A: zenodo_deposit.py (recommended)
+
+The script `rules/scripts/zenodo_deposit.py` handles packaging and upload in a single command. It reads all publication metadata directly from `CITATION.cff` — title, version, authors, abstract, keywords, and license — so there is no manual data entry.
+
+**Step 1: Generate a Zenodo access token**
+
+For sandbox (safe testing):
+[sandbox.zenodo.org/account/settings/applications](https://sandbox.zenodo.org/account/settings/applications/)
+
+For production:
+[zenodo.org/account/settings/applications](https://zenodo.org/account/settings/applications/)
+
+Create a new Personal Access Token with the `deposit:write` and `deposit:actions` scopes.
+
+**Step 2: Run the deposit script**
+
+<Tabs>
+  <Tab title="Sandbox (test)">
+    ```bash
+    export ZENODO_TOKEN="your_sandbox_token_here"
+    python3 rules/scripts/zenodo_deposit.py
+    ```
+
+    Creates a draft deposition on `sandbox.zenodo.org`. No DOI is minted and the record is not publicly visible. Use this to verify metadata before going to production.
+  </Tab>
+  <Tab title="Production (draft)">
+    ```bash
+    export ZENODO_TOKEN="your_production_token_here"
+    python3 rules/scripts/zenodo_deposit.py --production
+    ```
+
+    Creates a draft deposition on `zenodo.org`. The draft URL is printed to stdout — review and edit the record in the Zenodo UI before publishing.
+  </Tab>
+  <Tab title="Production (publish)">
+    ```bash
+    export ZENODO_TOKEN="your_production_token_here"
+    python3 rules/scripts/zenodo_deposit.py --production --publish
+    ```
+
+    Creates the draft and immediately prompts for confirmation before publishing. **Publishing is irreversible** — once a record is published, a DOI is minted and the record cannot be deleted (only new versions can be added).
+  </Tab>
+</Tabs>
+
+The script performs the following steps automatically:
+
+1. Packages the repository with `git archive --format=zip HEAD`
+2. Parses `CITATION.cff` for title, version, creators, abstract, keywords, and license
+3. Creates a new draft deposition via the Zenodo REST API
+4. Uploads the zip archive to the deposition's S3 bucket
+5. Updates the deposition metadata
+6. Prints the draft review URL
+
+### Option B: Native GitHub–Zenodo integration
+
+For fully automated DOI minting on every GitHub Release:
+
+1. Log in to [zenodo.org](https://zenodo.org) using your GitHub credentials
+2. Navigate to your Zenodo profile → **GitHub** settings
+3. Toggle the switch for `BDB-Genomics/atacseq-pipeline` to **On**
+4. Create a new GitHub Release on the repository (any tag format works)
+5. Zenodo automatically captures the release archive and mints a new DOI
+
+<Note>
+The GitHub–Zenodo integration mints a DOI immediately on release creation. Use Option A with the sandbox first to verify the metadata you want to appear on the Zenodo record before creating the GitHub Release.
+</Note>
+
+---
+
+## Citation
+
+If you use this pipeline in your research, please cite it using the following reference drawn from `CITATION.cff`:
+
+```yaml
+cff-version: 1.2.0
+message: "If you use this software, please cite it as below."
+authors:
+  - family-names: "Bhandary"
+    given-names: "Himanshu"
+    email: "2032ushimanshu@gmail.com"
+    affiliation: "BDB-Genomics"
+title: "BDB-Genomics ATAC-seq Framework"
+version: 3.0.0
+date-released: 2026-05-17
+url: "https://github.com/BDB-Genomics/atacseq-pipeline"
+repository-code: "https://github.com/BDB-Genomics/atacseq-pipeline"
+license: MIT
+keywords:
+  - "ATAC-seq"
+  - "Bioinformatics"
+  - "Snakemake"
+  - "Genomics"
+  - "Reproducibility"
+abstract: >
+  A production-grade, modular, and containerized Snakemake framework for
+  end-to-end ATAC-seq data analysis, from raw reads to peak calling, IDR
+  replicate concordance, footprinting, chromVAR motif analysis, differential
+  accessibility, and ENCODE-compliant QC.
+```
+
+**Formatted citation:**
+
+> Bhandary, H. (2026). *BDB-Genomics ATAC-seq Framework* (Version 3.0.0). GitHub. https://github.com/BDB-Genomics/atacseq-pipeline
+
+## License
+
+The BDB-Genomics ATAC-seq Framework is released under the **MIT License**. You are free to use, modify, and distribute the software for any purpose, provided the original copyright notice and license text are retained. See the `LICENSE` file in the repository root for the full license text.
+
+*Thank you for helping build better open science.*

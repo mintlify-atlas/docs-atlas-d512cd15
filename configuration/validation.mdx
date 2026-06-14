@@ -1,0 +1,259 @@
+---
+title: "Config Validation: validate_config.py Reference"
+sidebarTitle: "Validation"
+description: "How validate_config.py auto-validates config keys, sample sheets, FASTQ paths, conda envs, and reference files before the DAG builds."
+---
+
+Before Snakemake constructs the DAG and executes a single rule, the pipeline automatically runs `rules/scripts/validate_config.py` against your `config.yaml`. This early validation catches every class of misconfiguration — missing reference files, malformed sample sheets, incorrect parameter types, missing conda environment definitions — and surfaces them all at once with categorised, actionable error messages. A clean validation run prints `[CONFIG VALIDATION] OK` and allows the pipeline to proceed; any failure exits with code `1` and a formatted error report.
+
+---
+
+## Automatic Invocation
+
+The validator is called unconditionally from the Snakefile's top-level scope, before any rule is parsed or target file is computed:
+
+```python
+# Snakefile
+try:
+    subprocess.run(
+        ["python3", "rules/scripts/validate_config.py", "config.yaml"],
+        check=True,
+    )
+except subprocess.CalledProcessError as e:
+    print(f"\n[CRITICAL ERROR] Configuration validation failed for 'config.yaml'.")
+    print(f"Please check the validation script output above for specific missing keys or errors.\n")
+    raise e
+```
+
+If the subprocess exits with a non-zero code, Snakemake raises the exception and halts immediately, before any rule execution begins.
+
+---
+
+## Manual Invocation
+
+You can also run the validator independently without starting the full pipeline — useful when editing `config.yaml` or debugging a new tool block:
+
+```bash
+python3 rules/scripts/validate_config.py config.yaml
+```
+
+<Tip>
+  Run the validator manually after every non-trivial edit to `config.yaml`. It is significantly faster than a dry-run (`snakemake -n`) and provides more targeted error messages.
+</Tip>
+
+### Exit Codes
+
+| Code | Meaning |
+|---|---|
+| `0` | All checks passed. Pipeline may proceed. |
+| `1` | One or more validation errors found. Inspect the printed report. |
+
+---
+
+## Validation Stages
+
+The validator executes seven distinct checks in sequence. All errors are accumulated across every stage and printed together — the run does not stop at the first error.
+
+<Steps>
+  <Step title="Config file existence and YAML syntax">
+    Checks that the path supplied as `sys.argv[1]` exists and that its contents can be parsed as valid YAML. A `yaml.YAMLError` is caught and reported as a human-readable message. The config root must be a YAML mapping (object), not a list or scalar.
+
+    ```python
+    def load_config(config_path: Path, errors: list[str]) -> dict[str, Any]:
+        if not config_path.exists():
+            errors.append(f"Config file not found: {config_path}")
+            return {}
+        try:
+            with config_path.open("r", encoding="utf-8") as handle:
+                data = yaml.safe_load(handle) or {}
+        except yaml.YAMLError as exc:
+            errors.append(f"Could not parse YAML config '{config_path}': {exc}")
+            return {}
+        if not isinstance(data, dict):
+            errors.append("Config root must be a mapping/object.")
+            return {}
+        return data
+    ```
+  </Step>
+
+  <Step title="Required config key discovery">
+    The validator statically analyses the Snakefile and every `.smk` file under `rules/` to discover which config keys the pipeline actually reads. It uses the regular expression `config((?:\[['"][^'"]+['"]\])+)` to extract key paths such as `config['qc_gate']['params']['min_frip']`.
+
+    ```python
+    CONFIG_ACCESS_PATTERN = re.compile(r"config((?:\[['\""][^'\"]+['\"]\])+)")
+    CONFIG_KEY_PATTERN    = re.compile(r"\[['\""]([^'\"]+)['\"]\]")
+
+    def collect_required_config_paths(root: Path, errors: list[str]) -> list[tuple[str, ...]]:
+        paths: set[tuple[str, ...]] = set()
+        workflow_files = [root / "Snakefile", *sorted((root / "rules").glob("*.smk"))]
+        for workflow_file in workflow_files:
+            with workflow_file.open("r", encoding="utf-8") as handle:
+                for line in handle:
+                    for raw_keys in CONFIG_ACCESS_PATTERN.findall(line):
+                        keys = tuple(CONFIG_KEY_PATTERN.findall(raw_keys))
+                        if keys:
+                            paths.add(keys)
+        return sorted(paths, key=lambda item: (len(item), item))
+    ```
+
+    Any key path present in a rule file but absent from `config.yaml` is reported as a **Schema/Keys** error. Parent-key errors suppress child-key errors to avoid noise (if `qc_gate` is missing, the validator does not also report `qc_gate.params.min_frip`).
+  </Step>
+
+  <Step title="Scalar type validation">
+    The validator walks the entire config tree and checks the type of values whose key names match known suffixes.
+
+    **Positive integers** — keys ending in any of:
+    `threads`, `mem_mb`, `trim_front1`, `trim_front2`, `length_required`, `MAPQ`, `flags`, `min_length`, `max_length`, `max_fragment`, `upstream`, `downstream`, `bin_size`
+
+    **Non-negative floats** — keys ending in any of:
+    `min_frip`, `min_tss_enr`, `min_mapping_rate`, `max_duplicate_rate`, `qvalue`, `M`
+
+    **Non-empty strings** — keys named exactly:
+    `time`, `mito_chr`, `genome_size`, `feature_types`
+
+    ```python
+    positive_int_suffixes = (
+        "threads", "mem_mb", "trim_front1", "trim_front2",
+        "length_required", "MAPQ", "flags", "min_length",
+        "max_length", "max_fragment", "upstream", "downstream", "bin_size",
+    )
+    positive_float_suffixes = (
+        "min_frip", "min_tss_enr", "min_mapping_rate",
+        "max_duplicate_rate", "qvalue", "M",
+    )
+    non_empty_string_suffixes = (
+        "time", "mito_chr", "genome_size", "feature_types",
+    )
+    ```
+
+    <Note>
+      `time` accepts a positive integer or float (minutes) as well as a non-empty string. This allows both `time: 120` and `time: "2:00:00"` formats.
+    </Note>
+  </Step>
+
+  <Step title="Sample sheet validation">
+    The validator locates the sample sheet via `global.samples`, resolves it using a four-base search (config directory → workflow root → `cwd`), and then validates every row:
+
+    - **Header check** — all five columns from `SAMPLE_COLUMNS = ("sample", "fastq_r1", "fastq_r2", "replicate", "condition")` must be present.
+    - **Sample name regex** — each `sample` value must match `^[A-Za-z0-9._-]+$`.
+    - **Duplicate sample IDs** — the `sample` column must be globally unique.
+    - **Replicate type** — `replicate` must parse as a positive integer.
+    - **Duplicate condition/replicate pairs** — the combination of `condition` + `replicate` must be unique.
+    - **FASTQ path existence** — both `fastq_r1` and `fastq_r2` are resolved against four bases (sample sheet dir → config dir → workflow root → `cwd`). Missing files are reported individually.
+    - **R1 ≠ R2** — the two FASTQ paths must not be identical.
+    - **Control cross-reference** — if the optional `control` column is present, every non-`NONE` value must match a `sample` ID that appears elsewhere in the sheet.
+  </Step>
+
+  <Step title="fastp input mapping cross-check">
+    If `fastp.input` is populated in `config.yaml` (it is absent by default — FASTQ paths come from the sample sheet), the validator checks that the set of sample names in `fastp.input` exactly matches the set in the sample sheet, and that the R1/R2 paths agree between both sources.
+  </Step>
+
+  <Step title="Reference file path checks">
+    The validator walks the `global.references` block and validates every file path it finds. The check is triggered for keys matching specific suffixes (`_fa`, `_bed`, `_gtf`, `_index`, `_sizes`, `_db`) or the literal key `blacklist`.
+
+    For `bowtie2_index`, existence is checked by globbing for `.bt2` or `.bt2l` files matching the prefix — a directory containing `genome.1.bt2` satisfies the check for prefix `genome`. All other reference paths must resolve to an existing regular file.
+
+    ```python
+    is_global_ref = (next_prefix[0] == "global" and (
+        key.endswith(("_fa", "_bed", "_gtf", "_index", "_sizes", "_db")) or
+        key == "blacklist"
+    ))
+    ```
+  </Step>
+
+  <Step title="Conda environment file existence">
+    The validator scans every `.smk` file for `conda:` directives using the pattern `conda:\s*['"]([^'"]+)['"]`. Each matched path is resolved relative to the `.smk` file's directory (mirroring Snakemake's own resolution behaviour) and checked for existence.
+
+    ```python
+    conda_pattern = re.compile(r"conda:\s*['\"]([^'\"]+)['\"]")
+    for workflow_file in sorted((root / "rules").glob("*.smk")):
+        for line_no, line in enumerate(handle, start=1):
+            match = conda_pattern.search(line)
+            if match:
+                conda_path_str = match.group(1)
+                resolved_path = (workflow_file.parent / conda_path_str).resolve()
+                if not resolved_path.exists():
+                    errors.append(
+                        f"Conda environment file not found: '{conda_path_str}' "
+                        f"(referenced in {workflow_file.relative_to(root)}:{line_no})"
+                    )
+    ```
+  </Step>
+</Steps>
+
+---
+
+## Error Categorisation
+
+When validation fails, errors are grouped into four categories and printed with ANSI colour coding:
+
+```
+┏━ CONFIGURATION VALIDATION FAILED ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━┓
+
+  [Reference Files]
+    • Index prefix not found for config key 'global.references.bowtie2_index': data/reference/index/genome
+      Hint: Check if the file exists at: /home/user/project/data/reference/index/genome
+
+  [Sample Sheet]
+    • Duplicate sample ID 'CTRL_rep1' at row 4.
+    • FASTQ R1 not found for sample 'TREAT_rep2' at row 5: data/fastq/TREAT_rep2_R1.fastq.gz
+
+  [Schema/Keys]
+    • Missing config key: qc_gate.params.min_frip
+
+  [Parameters]
+    • Config value 'bowtie2.threads' must be a positive integer.
+
+┗━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━┛
+```
+
+| Category | Triggered by |
+|---|---|
+| **Reference Files** | Messages containing `path not found`, `index prefix`, or `not a file` |
+| **Sample Sheet** | Messages containing `Sample sheet`, `sample ID`, or `FASTQ` |
+| **Schema/Keys** | Messages containing `Missing config key` |
+| **Parameters** | All other messages (type errors, format errors) |
+
+For errors referencing a path under `data/`, the validator also prints an absolute-path hint to help locate the missing file on disk.
+
+---
+
+## FASTQ Path Resolution Algorithm
+
+Both the sample sheet validator and the reference path checker use the same multi-base resolution strategy. Relative paths are tried against each base in order; the first existing match is used:
+
+```python
+def resolve_existing_path(raw_value: str, bases: list[Path]) -> Path | None:
+    for candidate in candidate_paths(raw_value, bases):
+        if candidate.exists():
+            return candidate
+    return None
+
+def candidate_paths(raw_value: str, bases: list[Path]) -> list[Path]:
+    raw_path = Path(raw_value).expanduser()
+    if raw_path.is_absolute():
+        return [raw_path.resolve()]
+    candidates: list[Path] = []
+    seen: set[Path] = set()
+    for base in bases:
+        candidate = (base / raw_path).resolve()
+        if candidate not in seen:
+            candidates.append(candidate)
+            seen.add(candidate)
+    return candidates
+```
+
+Absolute paths short-circuit the search and are returned immediately. Duplicate candidate paths (which can occur when `cwd` equals the config directory) are deduplicated via the `seen` set.
+
+---
+
+## Example: Clean Validation Output
+
+A fully valid configuration prints a single success line:
+
+```bash
+$ python3 rules/scripts/validate_config.py config.yaml
+[CONFIG VALIDATION] OK: /home/user/project/data/fastp/samples.tsv
+```
+
+The path printed is the absolute path of the resolved sample sheet, confirming exactly which file was validated.

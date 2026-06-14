@@ -1,0 +1,178 @@
+---
+title: "Sample Sheet Format and Validation Rules"
+sidebarTitle: "Sample Sheet"
+description: "TSV sample sheet specification for the ATAC-seq pipeline: required columns, naming rules, duplicate detection, and FASTQ path resolution."
+---
+
+The sample sheet is a tab-separated values (TSV) file that tells the pipeline which samples to process, where their FASTQ files live, and how they are grouped for downstream analysis such as IDR and differential accessibility. It is the authoritative record of your experiment's design. Every aspect of the sheet — column names, sample identifiers, replicate numbering, and file paths — is validated before the Snakemake DAG is constructed, so errors surface immediately with a clear error message rather than mid-run failures.
+
+## Registering the Sample Sheet
+
+Point the pipeline to your sample sheet by setting `global.samples` in `config.yaml`:
+
+```yaml
+global:
+  samples: "data/fastp/samples.tsv"
+```
+
+The validator resolves this path against three bases in order: the directory containing `config.yaml`, the workflow root, and the current working directory. The first match wins.
+
+---
+
+## Required Columns
+
+The sample sheet **must** contain a header row with exactly these five column names (order does not matter):
+
+| Column | Type | Description |
+|---|---|---|
+| `sample` | string | Unique sample identifier |
+| `fastq_r1` | string | Path to R1 (forward) FASTQ file |
+| `fastq_r2` | string | Path to R2 (reverse) FASTQ file |
+| `replicate` | positive integer | Replicate number within the condition |
+| `condition` | string | Experimental condition label |
+
+These column names are defined in `validate_config.py` as:
+
+```python
+SAMPLE_COLUMNS = ("sample", "fastq_r1", "fastq_r2", "replicate", "condition")
+```
+
+<Warning>
+  The header row must use tab delimiters and exactly these column names. Trailing whitespace in column names is stripped, but spelling differences (e.g. `Replicate` vs `replicate`) will cause a validation failure.
+</Warning>
+
+---
+
+## Optional Column
+
+<ParamField path="control" type="string" default="NONE">
+  Name of the control (input) sample for this sample. Set to `NONE` or leave the column absent if no matched control exists. When provided, the validator checks that the referenced control sample ID exists elsewhere in the sheet.
+</ParamField>
+
+---
+
+## Sample Naming Constraints
+
+Sample identifiers are validated against the regular expression:
+
+```python
+SAMPLE_NAME_PATTERN = re.compile(r"^[A-Za-z0-9._-]+$")
+```
+
+Allowed characters are ASCII letters (`A–Z`, `a–z`), digits (`0–9`), dots (`.`), underscores (`_`), and hyphens (`-`). Spaces, slashes, parentheses, and any other special characters will trigger a validation error.
+
+<Tip>
+  Keep sample names short and meaningful. They propagate into every output filename — for example `results/peak_calling/macs2_peakcall/CTRL_1_peaks.narrowPeak` — so long names make directory listings harder to navigate.
+</Tip>
+
+---
+
+## Duplicate Detection
+
+The validator enforces two uniqueness rules:
+
+1. **Duplicate sample IDs** — the `sample` column value must be globally unique across all rows.
+2. **Duplicate condition/replicate pairs** — the combination of `condition` + `replicate` must be unique. Two different sample names cannot share the same condition and replicate number.
+
+Both checks report the offending row number so you can locate the problem immediately.
+
+---
+
+## Example Sample Sheet
+
+The following sheet defines a 2 × 2 factorial design (two conditions, two replicates each) with no matched controls:
+
+```tsv
+sample	fastq_r1	fastq_r2	replicate	condition
+CTRL_rep1	data/fastq/CTRL_rep1_R1.fastq.gz	data/fastq/CTRL_rep1_R2.fastq.gz	1	CTRL
+CTRL_rep2	data/fastq/CTRL_rep2_R1.fastq.gz	data/fastq/CTRL_rep2_R2.fastq.gz	2	CTRL
+TREAT_rep1	data/fastq/TREAT_rep1_R1.fastq.gz	data/fastq/TREAT_rep1_R2.fastq.gz	1	TREAT
+TREAT_rep2	data/fastq/TREAT_rep2_R1.fastq.gz	data/fastq/TREAT_rep2_R2.fastq.gz	2	TREAT
+```
+
+With a matched control column:
+
+```tsv
+sample	fastq_r1	fastq_r2	replicate	condition	control
+INPUT_rep1	data/fastq/INPUT_rep1_R1.fastq.gz	data/fastq/INPUT_rep1_R2.fastq.gz	1	INPUT	NONE
+TREAT_rep1	data/fastq/TREAT_rep1_R1.fastq.gz	data/fastq/TREAT_rep1_R2.fastq.gz	1	TREAT	INPUT_rep1
+TREAT_rep2	data/fastq/TREAT_rep2_R1.fastq.gz	data/fastq/TREAT_rep2_R2.fastq.gz	2	TREAT	INPUT_rep1
+```
+
+---
+
+## FASTQ Path Resolution
+
+FASTQ paths in the `fastq_r1` and `fastq_r2` columns can be absolute or relative. The validator resolves relative paths against four bases in priority order:
+
+<Steps>
+  <Step title="Sample sheet directory">
+    The directory containing the TSV file itself (`samples_path.parent`).
+  </Step>
+  <Step title="Config file directory">
+    The directory containing `config.yaml` (`config_path.parent`).
+  </Step>
+  <Step title="Workflow root">
+    The repository root, resolved from the location of `validate_config.py` two directories up (`__file__.parents[2]`).
+  </Step>
+  <Step title="Current working directory">
+    The shell's `$PWD` at the time `snakemake` is invoked.
+  </Step>
+</Steps>
+
+The validator reports an error for every FASTQ file it cannot resolve. It also checks that R1 and R2 paths are not identical.
+
+<Note>
+  Absolute paths (starting with `/`) bypass the resolution chain and are used as-is. This is the safest option when running the pipeline from varying working directories.
+</Note>
+
+---
+
+## How the Snakefile Consumes the Sheet
+
+The Snakefile reads the sample sheet once at startup using Python's `csv.DictReader` and builds three global dictionaries:
+
+```python
+SAMPLES_TSV = Path(config["global"]["samples"])
+with SAMPLES_TSV.open(newline="") as handle:
+    rows = list(csv.DictReader(handle, delimiter="\t"))
+
+SAMPLES    = [row["sample"]    for row in rows]
+FASTQ_R1   = {row["sample"]: row["fastq_r1"] for row in rows}
+FASTQ_R2   = {row["sample"]: row["fastq_r2"] for row in rows}
+```
+
+The `SAMPLES` list drives all `expand()` calls that generate per-sample target files. `FASTQ_R1` and `FASTQ_R2` are passed as inputs to the `fastp` rule. Conditions and replicates from the sheet are also used to build IDR target pairs:
+
+```python
+_cond_reps = defaultdict(list)
+for row in rows:
+    _cond_reps[row["condition"]].append(row["replicate"])
+```
+
+All replicate combinations within each condition are paired exhaustively for IDR analysis, so a condition with three replicates generates three IDR comparisons (rep1 vs rep2, rep1 vs rep3, rep2 vs rep3).
+
+---
+
+## Common Validation Errors
+
+<AccordionGroup>
+  <Accordion title="Sample sheet is missing required columns">
+    The header row does not include one or more of `sample`, `fastq_r1`, `fastq_r2`, `replicate`, `condition`. Check for typos or extra whitespace in the header.
+  </Accordion>
+  <Accordion title="Sample contains unsupported characters">
+    The `sample` value at a given row fails the `^[A-Za-z0-9._-]+$` regex. Remove spaces, slashes, or special characters from the identifier.
+  </Accordion>
+  <Accordion title="Duplicate sample ID">
+    Two rows share the same `sample` value. Every sample must have a unique name.
+  </Accordion>
+  <Accordion title="Duplicate condition/replicate pair">
+    Two samples share the same `condition` and `replicate` number. Assign distinct replicate numbers within each condition.
+  </Accordion>
+  <Accordion title="FASTQ R1/R2 not found">
+    The validator could not locate a FASTQ file at any of the four resolution bases. Verify the path is correct or use an absolute path.
+  </Accordion>
+  <Accordion title="Control sample not found in sheet">
+    The `control` column references a sample name that does not appear in the `sample` column of any other row.
+  </Accordion>
+</AccordionGroup>

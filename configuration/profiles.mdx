@@ -1,0 +1,514 @@
+---
+title: "Execution Profiles for Local, HPC, and Cloud"
+sidebarTitle: "Profiles"
+description: "Reference for all 8 Snakemake execution profiles: local, SLURM, low-resource, test, AWS, GCP, Azure, and Kubernetes."
+---
+
+Snakemake profiles are directories containing a `config.yaml` that pre-configure the executor, resource defaults, and scheduler behaviour for a specific compute environment. Instead of passing dozens of flags on the command line, you select a profile with `--profile profile/<name>` and all settings load automatically. The BDB-Genomics ATAC-seq pipeline ships eight profiles covering every major execution target, from a laptop to multi-cloud Kubernetes clusters.
+
+Every profile's config keys override or extend Snakemake's built-in defaults. Per-rule resource declarations in `config.yaml` (the pipeline config, not the profile config) always take precedence over a profile's `default-resources` block, which acts only as a fallback for rules that do not declare their own requirements.
+
+---
+
+## local
+
+The local profile is the recommended starting point for development, debugging, and single-machine production runs.
+
+```bash
+snakemake --profile profile/local
+```
+
+```yaml
+# profile/local/config.yaml
+use-conda: true
+jobs: 8
+printshellcmds: true
+show-failed-logs: true
+keep-going: true
+rerun-incomplete: true
+restart-times: 0
+
+default-resources:
+  mem_mb: 4000
+  time: 60
+  threads: 1
+```
+
+<CardGroup cols={2}>
+  <Card title="jobs: 8" icon="microchip">
+    Up to 8 rules execute in parallel. Tune this to match your machine's logical CPU count.
+  </Card>
+  <Card title="keep-going: true" icon="arrow-right">
+    Independent branches of the DAG continue even if one rule fails, maximising throughput on partial failures.
+  </Card>
+  <Card title="rerun-incomplete: true" icon="rotate">
+    Output files from interrupted rules are automatically re-generated on the next run.
+  </Card>
+  <Card title="restart-times: 0" icon="ban">
+    Failed rules are not automatically retried locally. Investigate logs before re-running.
+  </Card>
+</CardGroup>
+
+---
+
+## slurm
+
+The SLURM profile submits every rule as an independent batch job via the native `snakemake-executor-plugin-slurm`.
+
+```bash
+snakemake --profile profile/slurm
+```
+
+```yaml
+# profile/slurm/config.yaml
+executor: slurm
+use-conda: true
+jobs: 100
+printshellcmds: true
+show-failed-logs: true
+keep-going: true
+rerun-incomplete: true
+restart-times: 1
+
+latency-wait: 60
+
+default-resources:
+  mem_mb: 4000
+  time: 60
+  threads: 1
+  slurm_partition: "standard"
+  slurm_account: "bdb_genomics"
+```
+
+<ParamField path="executor" type="string" default="slurm">
+  Selects the SLURM executor plugin. Requires `snakemake-executor-plugin-slurm` to be installed in the Snakemake environment.
+</ParamField>
+
+<ParamField path="jobs" type="integer" default="100">
+  Maximum number of concurrently queued or running SLURM jobs. Set this to stay within your cluster's fair-share policy.
+</ParamField>
+
+<ParamField path="latency-wait" type="integer" default="60">
+  Seconds Snakemake waits for output files to appear on shared storage after a job completes. Increase this if your cluster uses a high-latency network filesystem (e.g., Lustre over WAN).
+</ParamField>
+
+<ParamField path="default-resources.slurm_partition" type="string" default="standard">
+  Default SLURM partition for all jobs. Override per-rule in `config.yaml` resources if needed.
+</ParamField>
+
+<ParamField path="default-resources.slurm_account" type="string" default="bdb_genomics">
+  SLURM account to charge compute time against. Change this to your institutional account name.
+</ParamField>
+
+<Note>
+  `restart-times: 1` allows each SLURM job one automatic retry on failure — useful for transient scheduler preemptions. Do not set this higher without also checking `latency-wait`, as retries on NFS can cause false failures.
+</Note>
+
+---
+
+## low\_resource
+
+Designed for workstations with ≤ 8 GB RAM and ≤ 4 CPU cores. This profile caps memory and thread allocations for every named rule via Snakemake's `set-resources` directive, preventing out-of-memory kills on constrained hardware.
+
+```bash
+snakemake --profile profile/low_resource
+```
+
+```yaml
+# profile/low_resource/config.yaml
+use-conda: true
+jobs: 2
+keep-going: true
+rerun-incomplete: true
+restart-times: 0
+latency-wait: 30
+
+set-resources:
+  bowtie2_align:
+    mem_mb: 4000
+    threads: 2
+  samtools_sort:
+    mem_mb: 3000
+    threads: 2
+  samtools_markdup:
+    mem_mb: 4000
+    threads: 2
+  tn5_shift:
+    mem_mb: 3000
+    threads: 2
+  macs2_peak_calling:
+    mem_mb: 4000
+    threads: 2
+  tss_enrichment:
+    mem_mb: 4000
+    threads: 2
+  heatmap:
+    mem_mb: 4000
+    threads: 2
+  peak_annotation:
+    mem_mb: 4000
+    threads: 2
+  motif_analysis:
+    mem_mb: 4000
+    threads: 2
+  differential_accessibility:
+    mem_mb: 4000
+    threads: 2
+  chromvar_analysis:
+    mem_mb: 4000
+    threads: 2
+  footprinting:
+    mem_mb: 4000
+    threads: 2
+  tobias_atacorrect:
+    mem_mb: 4000
+    threads: 2
+  tobias_score_bigwig:
+    mem_mb: 4000
+    threads: 2
+  tobias_bindetect:
+    mem_mb: 4000
+    threads: 2
+  # ... (all rules explicitly capped — see profile file for the complete list)
+
+default-resources:
+  mem_mb: 2000
+  time: 120
+  threads: 1
+```
+
+<Warning>
+  Rules that declare `mem_mb: 16000` in `config.yaml` (e.g., `bowtie2`, `macs2`, `heatmap`) will be overridden to 4 GB by this profile. Alignment of large genomes may fail or produce incomplete results. This profile is intended for testing and development only.
+</Warning>
+
+The profile sets `jobs: 2` to prevent the two parallel jobs from simultaneously saturating available RAM. The `default-resources` fallback (`mem_mb: 2000, threads: 1`) applies to any rule not listed explicitly in `set-resources`.
+
+---
+
+## test
+
+The test profile is used in CI pipelines and for verifying the installation on synthetic or downsampled data. It loads its own `config_test.yaml` which relaxes QC thresholds for synthetic reads.
+
+```bash
+snakemake --profile profile/test
+```
+
+```yaml
+# profile/test/config.yaml
+use-conda: true
+jobs: 4
+printshellcmds: true
+show-failed-logs: true
+rerun-incomplete: true
+restart-times: 0
+configfile: "profile/test/config_test.yaml"
+
+default-resources:
+  mem_mb: 2000
+  time: 30
+  threads: 2
+```
+
+<Tip>
+  The `configfile: "profile/test/config_test.yaml"` directive automatically overlays the test-specific overrides (such as relaxed `qc_gate` thresholds) on top of the main `config.yaml`. You do not need to pass a second `--configfile` argument when using this profile.
+</Tip>
+
+---
+
+## aws
+
+Runs the pipeline on AWS Batch via the Tibanna executor plugin, with intermediate files stored in Amazon S3.
+
+```bash
+snakemake --profile profile/aws
+```
+
+```yaml
+# profile/aws/config.yaml
+executor: tibanna
+use-conda: true
+use-singularity: true
+jobs: 50
+keep-going: true
+rerun-incomplete: true
+restart-times: 1
+latency-wait: 120
+
+default-resources:
+  mem_mb: 4000
+  time: 60
+  threads: 1
+
+tibanna-sfn: "tibanna_unicorn_atacseq"
+default-remote-prefix: "YOUR_S3_BUCKET/atacseq-pipeline"
+default-remote-provider: "S3"
+```
+
+<Steps>
+  <Step title="Install the executor plugin">
+    ```bash
+    pip install snakemake-executor-plugin-tibanna tibanna
+    ```
+  </Step>
+  <Step title="Configure AWS credentials">
+    ```bash
+    aws configure
+    # or export AWS_ACCESS_KEY_ID and AWS_SECRET_ACCESS_KEY
+    ```
+  </Step>
+  <Step title="Deploy Tibanna unicorn (one-time)">
+    ```bash
+    tibanna deploy_unicorn -g atacseq -b YOUR_S3_BUCKET
+    ```
+  </Step>
+  <Step title="Create an S3 bucket for intermediate storage">
+    ```bash
+    aws s3 mb s3://your-bucket-name
+    ```
+  </Step>
+  <Step title="Update the profile config">
+    Replace `YOUR_S3_BUCKET` in `profile/aws/config.yaml` with your actual bucket name.
+  </Step>
+  <Step title="Run the pipeline">
+    ```bash
+    snakemake --profile profile/aws
+    ```
+  </Step>
+</Steps>
+
+<Note>
+  `use-singularity: true` is required because AWS Batch jobs run in container-isolated environments. Conda alone is insufficient for container-native execution.
+</Note>
+
+---
+
+## gcp
+
+Runs the pipeline on Google Cloud Life Sciences, with intermediate files in Google Cloud Storage.
+
+```bash
+snakemake --profile profile/gcp
+```
+
+```yaml
+# profile/gcp/config.yaml
+executor: google-lifesciences
+use-conda: true
+use-singularity: true
+jobs: 50
+keep-going: true
+rerun-incomplete: true
+restart-times: 1
+latency-wait: 120
+
+default-resources:
+  mem_mb: 4000
+  time: 60
+  threads: 1
+  machine_type: "n1-standard-4"
+
+google-lifesciences-project: "YOUR_GCP_PROJECT_ID"
+google-lifesciences-region: "us-central1"
+default-remote-prefix: "YOUR_GCS_BUCKET/atacseq-pipeline"
+default-remote-provider: "GS"
+```
+
+<Steps>
+  <Step title="Install the executor plugin">
+    ```bash
+    pip install snakemake-executor-plugin-google-lifesciences
+    ```
+  </Step>
+  <Step title="Authenticate with Google Cloud">
+    ```bash
+    gcloud auth application-default login
+    ```
+  </Step>
+  <Step title="Create a GCS bucket">
+    ```bash
+    gsutil mb gs://your-bucket-name
+    ```
+  </Step>
+  <Step title="Update the profile config">
+    Replace `YOUR_GCP_PROJECT_ID` and `YOUR_GCS_BUCKET` in `profile/gcp/config.yaml`.
+  </Step>
+  <Step title="Run the pipeline">
+    ```bash
+    snakemake --profile profile/gcp
+    ```
+  </Step>
+</Steps>
+
+<ParamField path="default-resources.machine_type" type="string" default="n1-standard-4">
+  Default GCE machine type. The `n1-standard-4` provides 4 vCPUs and 15 GB RAM. Increase to `n1-highmem-8` for memory-intensive rules like ArchR.
+</ParamField>
+
+<ParamField path="google-lifesciences-region" type="string" default="us-central1">
+  GCP region where Life Sciences pipelines execute. Choose a region close to your GCS bucket to minimise egress costs.
+</ParamField>
+
+---
+
+## azure
+
+Runs the pipeline on Azure Batch, with intermediate files in Azure Blob Storage.
+
+```bash
+snakemake --profile profile/azure
+```
+
+```yaml
+# profile/azure/config.yaml
+executor: azure-batch
+use-conda: true
+use-singularity: true
+jobs: 50
+keep-going: true
+rerun-incomplete: true
+restart-times: 1
+latency-wait: 120
+
+default-resources:
+  mem_mb: 4000
+  time: 60
+  threads: 1
+
+az-batch-account-url: "https://YOUR_BATCH_ACCOUNT.eastus.batch.azure.com"
+default-remote-prefix: "YOUR_BLOB_CONTAINER/atacseq-pipeline"
+default-remote-provider: "AzBlob"
+```
+
+<Steps>
+  <Step title="Install the executor plugin">
+    ```bash
+    pip install snakemake-executor-plugin-azure-batch
+    ```
+  </Step>
+  <Step title="Authenticate with Azure">
+    ```bash
+    az login
+    ```
+  </Step>
+  <Step title="Create a Batch account and storage account">
+    ```bash
+    az batch account create \
+      --name atacseqbatch \
+      --resource-group YOUR_RG \
+      --location eastus
+
+    az storage account create \
+      --name atacseqstorage \
+      --resource-group YOUR_RG \
+      --location eastus
+    ```
+  </Step>
+  <Step title="Create a Blob container">
+    ```bash
+    az storage container create \
+      --name atacseq-pipeline \
+      --account-name atacseqstorage
+    ```
+  </Step>
+  <Step title="Update the profile config">
+    Replace `YOUR_BATCH_ACCOUNT` and `YOUR_BLOB_CONTAINER` in `profile/azure/config.yaml`.
+  </Step>
+  <Step title="Run the pipeline">
+    ```bash
+    snakemake --profile profile/azure
+    ```
+  </Step>
+</Steps>
+
+---
+
+## kubernetes
+
+Runs each rule as a Kubernetes Pod on any conformant cluster (GKE, EKS, AKS, or local Minikube).
+
+```bash
+snakemake --profile profile/kubernetes
+```
+
+```yaml
+# profile/kubernetes/config.yaml
+executor: kubernetes
+use-conda: true
+use-singularity: true
+jobs: 50
+keep-going: true
+rerun-incomplete: true
+restart-times: 1
+latency-wait: 120
+
+default-resources:
+  mem_mb: 4000
+  time: 60
+  threads: 1
+
+kubernetes-namespace: "default"
+default-remote-prefix: "YOUR_BUCKET/atacseq-pipeline"
+default-remote-provider: "GS"       # or "S3" for AWS, "AzBlob" for Azure
+```
+
+<Steps>
+  <Step title="Install the executor plugin">
+    ```bash
+    pip install snakemake-executor-plugin-kubernetes
+    ```
+  </Step>
+  <Step title="Provision a cluster (example: GKE)">
+    ```bash
+    gcloud container clusters create atacseq-cluster --num-nodes=2
+    # EKS: eksctl create cluster --name atacseq-cluster --nodes=2
+    # Local: minikube start --memory=8192 --cpus=4
+    ```
+  </Step>
+  <Step title="Verify kubectl context">
+    ```bash
+    kubectl config current-context
+    ```
+  </Step>
+  <Step title="Create a cloud storage bucket and update the profile config">
+    Replace `YOUR_BUCKET` and set the correct `default-remote-provider` (`GS`, `S3`, or `AzBlob`) in `profile/kubernetes/config.yaml`.
+  </Step>
+  <Step title="Run the pipeline">
+    ```bash
+    snakemake --profile profile/kubernetes
+    ```
+  </Step>
+</Steps>
+
+<Warning>
+  Always delete your cluster after the run to avoid ongoing infrastructure costs. For GKE: `gcloud container clusters delete atacseq-cluster`. For EKS: `eksctl delete cluster --name atacseq-cluster`.
+</Warning>
+
+---
+
+## Profile Comparison
+
+<CardGroup cols={2}>
+  <Card title="local" icon="laptop">
+    **jobs:** 8 · **executor:** default (process fork) · **restart-times:** 0 · Best for: single-machine runs and development.
+  </Card>
+  <Card title="slurm" icon="server">
+    **jobs:** 100 · **executor:** slurm · **restart-times:** 1 · **latency-wait:** 60 s · Best for: university HPC clusters.
+  </Card>
+  <Card title="low_resource" icon="battery-low">
+    **jobs:** 2 · **executor:** default · All rules capped at ≤ 4 GB RAM. Best for: laptops and constrained VMs.
+  </Card>
+  <Card title="test" icon="flask">
+    **jobs:** 4 · **configfile:** `config_test.yaml` · Best for: CI pipelines and installation checks.
+  </Card>
+  <Card title="aws" icon="cloud">
+    **jobs:** 50 · **executor:** tibanna · **provider:** S3 · Best for: AWS Batch scale-out.
+  </Card>
+  <Card title="gcp" icon="cloud">
+    **jobs:** 50 · **executor:** google-lifesciences · **provider:** GS · Best for: Google Cloud Life Sciences.
+  </Card>
+  <Card title="azure" icon="cloud">
+    **jobs:** 50 · **executor:** azure-batch · **provider:** AzBlob · Best for: Azure Batch compute pools.
+  </Card>
+  <Card title="kubernetes" icon="circle-nodes">
+    **jobs:** 50 · **executor:** kubernetes · **provider:** GS/S3/AzBlob · Best for: container-native, multi-cloud.
+  </Card>
+</CardGroup>

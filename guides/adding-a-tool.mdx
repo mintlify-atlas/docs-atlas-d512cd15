@@ -1,0 +1,197 @@
+---
+title: "Adding a New Tool to the ATAC-seq Pipeline"
+sidebarTitle: "Adding a Tool"
+description: "Step-by-step guide to integrating any new bioinformatics tool into the BDB-Genomics ATAC-seq pipeline using its modular template system."
+---
+
+Every tool in the BDB-Genomics ATAC-seq pipeline lives in its own isolated Snakemake rule file (`.smk`) and its own Conda environment descriptor (`.yaml`). This strict one-tool-one-environment policy means you can add, swap, or remove any step in the DAG without touching the rest of the pipeline. All paths, thread counts, memory limits, and tool-specific flags are declared once in `config.yaml` — the rules themselves are stateless wrappers that read config at runtime. Follow the steps below to wire a new tool into the framework correctly.
+
+<Steps>
+
+### Create the Conda environment file
+
+Every tool runs inside its own isolated Conda environment. Create the environment descriptor under `rules/envs/<stage>/<toolname>.yaml`, where `<stage>` matches one of the existing pipeline stage directories (`01_preprocessing`, `02_alignment`, `03_post_alignment`, `04_metrics_qc`, `05_peak_calling`, `06_visualization`, or `misc`).
+
+Use `rules/envs/misc/template_tool.yaml` as your starting point:
+
+```yaml
+# rules/envs/misc/template_tool.yaml  (exact source content)
+name: template_env
+
+channels:
+  - conda-forge
+  - bioconda
+  - defaults
+
+dependencies:
+  - coreutils
+```
+
+Replace `template_env` with a meaningful environment name (e.g., `macs3_env`) and list every package your tool requires with pinned versions wherever possible. Prefer `bioconda` and `conda-forge` channels.
+
+<Tip>
+Pin major versions (e.g., `macs3=3.0.0`) to ensure reproducibility across CI runs and cluster deployments.
+</Tip>
+
+### Create the rule file
+
+Create `rules/<toolname>.smk`. Copy `rules/template_tool.smk` as boilerplate — it encodes every design constraint the pipeline enforces:
+
+```python
+# rules/template_tool.smk
+# [TEMPLATE] Name your rule here.
+rule template_tool:
+    # [TEMPLATE] Define inputs by pointing to the config file path dynamically.
+    input:
+        dummy_in=lambda wildcards: f"{config['template_category']['template_tool']['input']}/{wildcards.sample}_R1_trimmed.fastq.gz"
+    
+    # [TEMPLATE] Define outputs using wildcards (like {sample}) so Snakemake can parallelize.
+    output:
+        dummy_out=f"{config['template_category']['template_tool']['output']}/{{sample}}_template.txt"
+    
+    # [TEMPLATE] Pull custom parameters from the config file.
+    params:
+        message=config['template_category']['template_tool']['params']['message']
+    
+    # [TEMPLATE] Link threads and resources to ensure the scheduler allocates properly.
+    resources:
+        mem_mb=lambda wildcards, input, attempt: max(config['template_category']['template_tool']['resources']['mem_mb'], int(input.size_mb * 1.5)) * attempt,
+        time=lambda wildcards, attempt: config['template_category']['template_tool']['resources']['time'] * attempt,
+
+    log: "logs/template_category/template_tool/{sample}.log"
+    conda: "envs/misc/template_tool.yaml"
+    container: "https://depot.galaxyproject.org/singularity/python:3.10.4"
+    threads: config['template_category']['template_tool']['threads']
+
+    # [TEMPLATE] Specify where logs and benchmarks will be saved.
+    benchmark: "benchmarks/template_category/template_tool/{sample}.txt"
+    
+    # [TEMPLATE] The actual bash commands to run the tool.
+    shell:
+        """
+        echo "{params.message} Sample: {wildcards.sample}" > {output.dummy_out} 2> {log}
+        """
+```
+
+Key design points enforced by the template:
+
+<CardGroup cols={2}>
+  <Card title="No hardcoded paths" icon="ban">
+    Every input, output, and parameter reference goes through `config[...]`. Changing a path in `config.yaml` propagates to the rule automatically.
+  </Card>
+  <Card title="Resources from config" icon="sliders">
+    `mem_mb` and `time` are read from the config block and scaled by `attempt`, enabling automatic retry with more resources on cluster failures.
+  </Card>
+  <Card title="Wildcard parallelism" icon="bolt">
+    Use `{wildcards.sample}` in outputs so Snakemake can schedule all samples concurrently across available cores.
+  </Card>
+  <Card title="Isolated logs & benchmarks" icon="file-lines">
+    Each rule writes to `logs/<category>/<tool>/{sample}.log` and `benchmarks/<category>/<tool>/{sample}.txt` — never to stdout.
+  </Card>
+</CardGroup>
+
+### Add the config block to config.yaml
+
+Open `config.yaml` and add a new block that follows the uniform schema used throughout the file. The `template_category` / `template_tool` section at the bottom of `config.yaml` is the canonical reference:
+
+```yaml
+# config.yaml — add under the appropriate stage comment header
+template_category:   # [REPLACE] e.g., peak_calling, qc, visualization
+  template_tool:     # [REPLACE] e.g., macs3, homer, deeptools
+    # [REPLACE] Input directory — typically a previous tool's output directory.
+    input: "results/preprocessing/fastp"
+    # [REPLACE] Output directory for this tool's results.
+    output: "results/template_category/template_tool"
+    # [OPTIONAL] Tool-specific flags and parameters.
+    params:
+      message: "This is a boilerplate template."
+    # [REPLACE] CPU threads to allocate.
+    threads: 1
+    # [REPLACE] Memory (MB) and wall-clock time (minutes) for cluster jobs.
+    resources:
+      mem_mb: 1000
+      time: 10
+```
+
+YAML anchors (`&GENOME_FA`, `*GENOME_FA`) are used throughout `config.yaml` to centralise shared reference paths. If your tool needs a reference genome or blacklist, reuse an existing anchor rather than duplicating the path.
+
+<Note>
+The `global.references` section at the top of `config.yaml` defines all YAML anchors. Use `*GENOME_FA`, `*BOWTIE2_INDEX`, `*BLACKLIST`, `*ANNOTATION_GTF`, and `*MOTIF_DB` wherever your rule needs those paths in `params`.
+</Note>
+
+### Include the rule in the Snakefile
+
+Open the root `Snakefile` and add an `include` directive alongside the other rule includes:
+
+```python
+# Snakefile — add with the other include statements (grouped by pipeline stage)
+include: "rules/template_tool.smk"
+```
+
+The includes are ordered by pipeline stage (preprocessing → alignment → post-alignment → metrics → peak calling → visualization). Place your include in the correct stage group so the file remains readable.
+
+### Add output targets to the appropriate target list
+
+Find the target list in the `Snakefile` that corresponds to your tool's stage and append the expected output files for each sample. For example:
+
+```python
+# Snakefile — inside the relevant target-building block
+expand(
+    f"{config['template_category']['template_tool']['output']}/{{sample}}_template.txt",
+    sample=samples
+)
+```
+
+### Validate the config block
+
+Run `validate_config.py` to confirm your new block is structurally sound before executing any rules:
+
+```bash
+python3 rules/scripts/validate_config.py
+```
+
+A successful run prints a summary of every validated key. Any missing required field or type mismatch is reported as an error with the offending key path.
+
+<Warning>
+The CI pipeline runs `validate_config.py` as its first step. A config that fails validation will block the entire workflow from starting.
+</Warning>
+
+### Test with synthetic data
+
+Generate the minimal CI dataset and run the full pipeline to confirm your new rule wires up correctly end-to-end:
+
+```bash
+# Step 1: generate synthetic FASTQs, reference genome, GTF, Bowtie2 index,
+#         chrom.sizes, and ENCODE blacklist BED (no internet required)
+python3 rules/scripts/generate_test_data.py
+
+# Step 2: run the pipeline — your new rule will be scheduled automatically
+#         if it is reachable from the final targets
+snakemake --use-conda --cores 4
+```
+
+To run with the relaxed QC thresholds used in CI (useful for tiny synthetic datasets), use the test profile:
+
+```bash
+snakemake --profile profile/test --use-conda --cores 4
+```
+
+</Steps>
+
+## Design constraints summary
+
+<Accordion title="One tool, one .smk, one .yaml — always">
+Every tool gets its own `.smk` rule file and its own `.yaml` Conda environment. No rule may share an environment with another rule, and no rule may embed another tool's logic inline. This makes it possible to update, disable, or replace any single step without side effects.
+</Accordion>
+
+<Accordion title="No hardcoded paths — ever">
+Paths to inputs, outputs, references, and intermediate files must always come from `config.yaml`. The only string literals allowed inside a `.smk` rule are the log and benchmark path patterns (which include wildcards), and the conda/container directives (which point to files, not data).
+</Accordion>
+
+<Accordion title="Resources always come from config">
+`mem_mb` and `time` in the `resources:` block must be read from `config[...]['resources']`. The lambda-with-`attempt` pattern (`* attempt`) is mandatory so that Snakemake can automatically retry failed jobs with doubled resources on HPC clusters.
+</Accordion>
+
+<Accordion title="Fail fast — validate before you compute">
+Place sanity checks (file existence, minimum read counts, QC thresholds) before the expensive shell commands in your rule. Use the `run:` block or a wrapper script to emit a clear error message and non-zero exit code early, rather than letting the tool itself crash hours into a run.
+</Accordion>

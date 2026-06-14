@@ -1,0 +1,211 @@
+---
+title: "BDB-Genomics ATAC-seq Pipeline: Full Overview"
+sidebarTitle: "Overview"
+description: "End-to-end ATAC-seq framework covering all six pipeline stages, mode-switching logic, lifecycle hooks, and output directory structure."
+---
+
+The BDB-Genomics ATAC-seq Framework is a production-grade, config-driven Snakemake workflow for end-to-end chromatin accessibility analysis. Starting from raw paired-end FASTQ files, it executes six tightly ordered stages — Preprocessing, Alignment, Post-Alignment filtering, Metrics & QC, Peak Calling, and Visualization/Reporting — and produces a fully auditable set of BAMs, peak files, differential-accessibility tables, TF-footprint BigWigs, and an aggregated MultiQC HTML report. The entire pipeline is driven by a single `config.yaml` file; no Snakemake rule ever needs to be modified for routine use. Both bulk and single-cell modalities are supported from the same codebase, switched entirely through an environment variable.
+
+## Pipeline Stage Map
+
+| Stage | What it Does | Key Tools | Output Directory |
+|---|---|---|---|
+| **Preprocessing** | Adapter trimming, 5′-end trimming, QC reports | fastp, FastQC | `results/preprocessing/` |
+| **Alignment** | Map trimmed reads to reference genome | Bowtie2 (bulk) / Chromap (scATAC) | `results/alignment/` |
+| **Post-Alignment** | Dedup, MAPQ filter, blacklist removal, Tn5 shift | samtools, bedtools, deepTools | `results/post_alignment/` |
+| **Metrics & QC** | TSS enrichment, fragment sizes, QC gating | ATACseqQC (R), Picard, Preseq, Qualimap | `results/metrics_qc/`, `results/qc_gate/` |
+| **Peak Calling** | Peak calling, IDR, consensus peaks, DA, footprinting | MACS2, IDR, DESeq2, TOBIAS, HINT-ATAC, HOMER | `results/peak_calling/` |
+| **Visualization** | BigWigs, heatmaps, correlation, MultiQC report | deepTools, UCSC tools, MultiQC | `results/visualization/`, `results/reporting/` |
+
+## Six-Stage DAG
+
+```
+Raw FASTQs
+    │
+    ▼
+┌───────────────────┐
+│   Preprocessing   │  fastp (trim) → FastQC (report)
+└────────┬──────────┘
+         │
+         ▼
+┌───────────────────┐
+│    Alignment      │  Bowtie2 --very-sensitive (bulk)
+└────────┬──────────┘  Chromap --preset atac   (scATAC)
+         │
+         ▼
+┌───────────────────┐
+│  Post-Alignment   │  fixmate → markdup → mito remove →
+│    Filtering      │  MAPQ ≥ 30 → blacklist → Tn5 shift
+└────────┬──────────┘
+         │
+         ▼
+┌───────────────────┐
+│   Metrics & QC    │  TSS enrichment, FRiP, samtools stats
+│     QC Gate       │  → PASS / WARN / FAIL per sample
+└────────┬──────────┘
+         │
+    ┌────┴────┐
+    ▼         ▼
+┌──────┐  ┌──────────────┐
+│ Peak │  │ Visualization│
+│Calling│  │  & Reporting │
+└──────┘  └──────────────┘
+```
+
+## Modality Switching (`ATAC_MODE`)
+
+The pipeline determines which set of Snakemake rules to activate by reading the `ATAC_MODE` environment variable at startup. If the variable is not set, it falls back to `config.yaml → global.mode` (default: `"bulk"`).
+
+```bash
+# Bulk ATAC-seq (default)
+snakemake --use-conda --cores 8
+
+# Single-cell ATAC-seq
+ATAC_MODE=scatac snakemake --use-conda --cores 8
+```
+
+An invalid value raises a hard `ValueError` before any job is submitted:
+
+```python
+# Snakefile
+MODE = os.getenv("ATAC_MODE", config.get("global", {}).get("mode", "bulk"))
+if MODE not in ("bulk", "scatac"):
+    raise ValueError(
+        f"Invalid mode '{MODE}'. Use 'bulk' or 'scatac'. "
+        "Set via ATAC_MODE env var or config.yaml global.mode"
+    )
+```
+
+<Tabs>
+  <Tab title="Bulk Mode">
+    | Stage | Tool |
+    |---|---|
+    | Alignment | Bowtie2 (`--very-sensitive`) |
+    | Deduplication | samtools markdup (mark only, configurable) |
+    | Peak Calling | MACS2 (`BAMPE`, `--nomodel`) |
+    | Differential | DESeq2 (FDR 0.05, log2FC 1.0) |
+    | Footprinting | HINT-ATAC (RGT) + TOBIAS BINDetect |
+  </Tab>
+  <Tab title="scATAC Mode">
+    | Stage | Tool |
+    |---|---|
+    | Alignment | Chromap (`--preset atac`) |
+    | Cell Filtering | ArchR (Arrow files, doublet removal) |
+    | Peak Calling | ArchR marker peaks |
+    | Co-accessibility | Cicero (500 bp window, 250 kb distance) |
+    | Motif Accessibility | chromVAR |
+  </Tab>
+</Tabs>
+
+## Lifecycle Hooks
+
+The Snakefile registers three Snakemake lifecycle hooks that run automatically without any user intervention:
+
+<Steps>
+  <Step title="onstart">
+    Prints the active mode and detected sample count to stdout the moment Snakemake begins planning the DAG. No files are written.
+
+    ```python
+    onstart:
+        print(f"[START] BDB-Genomics ATAC-seq Framework")
+        print(f"Mode: {MODE.upper()}")
+        print(f"Samples: {len(SAMPLES)} samples detected")
+    ```
+  </Step>
+  <Step title="onsuccess">
+    Prints the path to the final MultiQC HTML report, then calls `aggregate_logs.py success` to write a machine-readable execution summary to `results/reporting/pipeline_execution_summary.json`.
+
+    ```python
+    onsuccess:
+        print(f"[SUCCESS] Pipeline completed successfully!")
+        print(f"Final MultiQC report: {config['multiqc']['output']}/multiqc_report.html")
+        subprocess.run([
+            "python3", "rules/scripts/aggregate_logs.py",
+            "success", "results/reporting/pipeline_execution_summary.json"
+        ])
+    ```
+  </Step>
+  <Step title="onerror">
+    Prints a pointer to the `logs/` directory, then calls `aggregate_logs.py error` with the same JSON path. On failure the JSON includes the last five error lines extracted from each log file, making post-mortem debugging straightforward.
+
+    ```python
+    onerror:
+        print(f"[ERROR] Pipeline encountered an error.")
+        print(f"Please check the log files in 'logs/' for details.")
+        subprocess.run([
+            "python3", "rules/scripts/aggregate_logs.py",
+            "error", "results/reporting/pipeline_execution_summary.json"
+        ])
+    ```
+  </Step>
+</Steps>
+
+## Configuration & Profiles
+
+All parameters live in `config.yaml`. You never need to touch a `.smk` rule file for routine analysis. Override individual keys on the command line without modifying the main config:
+
+```bash
+# Merge a custom override file at runtime
+snakemake --configfile config.yaml custom_override.yaml --cores 8
+```
+
+<CardGroup cols={2}>
+  <Card title="local" icon="laptop">
+    Up to 8 concurrent local jobs. Ideal for workstations.
+  </Card>
+  <Card title="slurm" icon="server">
+    Submits each rule as a SLURM job with per-rule memory/time limits.
+  </Card>
+  <Card title="low_resource" icon="memory">
+    Caps all rules at 4 GB RAM. Designed for laptops.
+  </Card>
+  <Card title="test" icon="flask">
+    Relaxed QC thresholds for synthetic CI datasets.
+  </Card>
+  <Card title="aws" icon="cloud">
+    AWS Batch + S3 + Tibanna executor.
+  </Card>
+  <Card title="kubernetes" icon="dharmachakra">
+    Container-native K8s scaling for large cohorts.
+  </Card>
+</CardGroup>
+
+## Output Manifest
+
+```
+results/
+├── preprocessing/          # Trimmed FASTQs, fastp HTML/JSON, FastQC reports
+├── alignment/              # Unsorted BAMs from Bowtie2 / Chromap
+├── post_alignment/         # Sorted, dedup, filtered, Tn5-shifted BAMs
+├── metrics_qc/             # TSS enrichment, fragment sizes, Picard metrics
+├── qc_gate/                # Per-sample _qc_pass.txt and _qc_pass.json
+├── peak_calling/           # MACS2 narrowPeaks, consensus BED, IDR, DESeq2
+├── visualization/          # BigWigs, heatmaps, correlation heatmap
+└── reporting/
+    ├── multiqc/            # multiqc_report.html
+    ├── benchmark_summary.tsv
+    └── pipeline_execution_summary.json
+```
+
+## Stage Pages
+
+<CardGroup cols={2}>
+  <Card title="Preprocessing" href="/pipeline/preprocessing" icon="scissors">
+    fastp trimming parameters and FastQC quality reporting.
+  </Card>
+  <Card title="Alignment" href="/pipeline/alignment" icon="dna">
+    Bowtie2 bulk alignment and coordinate sorting.
+  </Card>
+  <Card title="Post-Alignment" href="/pipeline/post-alignment" icon="filter">
+    Eight-step filtering chain from fixmate to Tn5 shift.
+  </Card>
+  <Card title="QC Gating" href="/pipeline/qc-gating" icon="shield-check">
+    Four-metric gate with PASS/WARN/FAIL tiers.
+  </Card>
+  <Card title="Peak Calling" href="/pipeline/peak-calling" icon="mountain">
+    MACS2, IDR, DESeq2, TOBIAS, HOMER, and more.
+  </Card>
+  <Card title="Visualization" href="/pipeline/visualization" icon="chart-line">
+    BigWigs, heatmaps, MultiQC, and benchmark summaries.
+  </Card>
+</CardGroup>

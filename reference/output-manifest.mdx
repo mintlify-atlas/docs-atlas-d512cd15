@@ -1,0 +1,564 @@
+---
+title: "BDB ATAC-seq Pipeline: Complete Output Directory Manifest"
+sidebarTitle: "Output Manifest"
+description: "Full listing of every results/ directory, key output files, benchmark artifacts, and log files produced by the BDB-Genomics ATAC-seq pipeline."
+---
+
+All pipeline outputs are written beneath the `results/` directory at the project root. The directory hierarchy mirrors the six-stage DAG — Preprocessing → Alignment → Post-alignment → Metrics & QC → Peak Calling → Visualization — so individual stages can be inspected or restarted independently. Per-rule benchmark timings land in `benchmarks/` and execution logs in `logs/`, both at the project root.
+
+<Note>
+Paths prefixed with `{sample}` expand to one file per entry in your `data/fastp/samples.tsv` sample sheet. Paths prefixed with `{condition}` or `{condition}_rep{N}_rep{M}` expand based on the condition/replicate columns in that sheet.
+</Note>
+
+---
+
+## Preprocessing
+
+<ResponseField name="results/preprocessing/fastp/" type="directory">
+  Adapter-trimmed and quality-filtered FASTQ files plus fastp QC reports.
+
+  <Expandable title="Key files">
+    <ResponseField name="{sample}_R1_trimmed.fastq.gz" type="file">
+      Trimmed Read 1 FASTQ (gzip-compressed). Produced by fastp with `trim_front1: 5` and `length_required: 30`.
+    </ResponseField>
+    <ResponseField name="{sample}_R2_trimmed.fastq.gz" type="file">
+      Trimmed Read 2 FASTQ (gzip-compressed).
+    </ResponseField>
+    <ResponseField name="{sample}_fastp.json" type="file">
+      Structured JSON QC report from fastp, ingested by MultiQC.
+    </ResponseField>
+    <ResponseField name="{sample}_fastp.html" type="file">
+      Interactive HTML QC report from fastp.
+    </ResponseField>
+  </Expandable>
+</ResponseField>
+
+<ResponseField name="results/preprocessing/fastqc/" type="directory">
+  Post-trimming per-read quality reports from FastQC.
+
+  <Expandable title="Key files">
+    <ResponseField name="{sample}_R1_trimmed_fastqc.html" type="file">
+      Interactive FastQC HTML report for trimmed Read 1.
+    </ResponseField>
+    <ResponseField name="{sample}_R2_trimmed_fastqc.html" type="file">
+      Interactive FastQC HTML report for trimmed Read 2.
+    </ResponseField>
+    <ResponseField name="{sample}_R1_trimmed_fastqc.zip" type="file">
+      Raw FastQC data archive for programmatic parsing.
+    </ResponseField>
+  </Expandable>
+</ResponseField>
+
+---
+
+## Alignment
+
+<ResponseField name="results/alignment/bowtie2/" type="directory">
+  Raw aligned BAM files from Bowtie2 (bulk ATAC-seq mode only).
+
+  <Expandable title="Key files">
+    <ResponseField name="{sample}.bam" type="file">
+      Unsorted BAM produced by `bowtie2 --very-sensitive` paired-end alignment to the reference genome.
+    </ResponseField>
+  </Expandable>
+</ResponseField>
+
+<ResponseField name="results/alignment/chromap/" type="directory">
+  Raw aligned BAM files from Chromap (scATAC-seq mode only; requires `global.mode: "scatac"`).
+
+  <Expandable title="Key files">
+    <ResponseField name="{sample}.bam" type="file">
+      BAM produced by `chromap --preset atac`. Used as input to the ArchR and Cicero scATAC-seq analysis rules.
+    </ResponseField>
+  </Expandable>
+</ResponseField>
+
+---
+
+## Post-Alignment Processing
+
+<ResponseField name="results/post_alignment/samtools_sort/" type="directory">
+  Coordinate-sorted BAMs.
+
+  <Expandable title="Key files">
+    <ResponseField name="{sample}.sorted.bam" type="file">
+      Coordinate-sorted BAM. Input to `samtools_fixmate`.
+    </ResponseField>
+  </Expandable>
+</ResponseField>
+
+<ResponseField name="results/post_alignment/samtools_fixmate/" type="directory">
+  BAMs with filled mate-score tags, required before duplicate marking.
+
+  <Expandable title="Key files">
+    <ResponseField name="{sample}.sorted.fixmate.bam" type="file">
+      Sorted BAM with mate-score tags filled by `samtools fixmate -m`.
+    </ResponseField>
+  </Expandable>
+</ResponseField>
+
+<ResponseField name="results/post_alignment/samtools_markdup/" type="directory">
+  PCR-duplicate-marked BAMs (duplicates retained by default).
+
+  <Expandable title="Key files">
+    <ResponseField name="{sample}.sorted.dedup.bam" type="file">
+      Deduplicated BAM. Duplicate reads are marked but not removed (`remove_duplicates: false`). Input to Picard, TOBIAS, and Qualimap.
+    </ResponseField>
+    <ResponseField name="{sample}.sorted.dedup.bam.bai" type="file">
+      BAM index produced by the `samtools_index_post_markdup` rule.
+    </ResponseField>
+  </Expandable>
+</ResponseField>
+
+<ResponseField name="results/post_alignment/remove_mito_reads/" type="directory">
+  Mitochondrial-read-free sorted BAMs.
+
+  <Expandable title="Key files">
+    <ResponseField name="{sample}_noMT.sorted.bam" type="file">
+      BAM with all reads mapping to `chrMT` (configurable via `remove_mito_reads.params.mito_chr`) excluded. Input to `samtools_view` and `samtools_stats`.
+    </ResponseField>
+  </Expandable>
+</ResponseField>
+
+<ResponseField name="results/post_alignment/samtools_view/" type="directory">
+  Quality-filtered, blacklist-cleaned BAMs.
+
+  <Expandable title="Key files">
+    <ResponseField name="{sample}.filtered.bam" type="file">
+      BAM after MAPQ ≥ 30 filtering (`-q 30`), flag-based exclusion (`-F 3844`), and ENCODE blacklist removal. Input to Tn5 shifting, TOBIAS, and cross-correlation analysis.
+    </ResponseField>
+    <ResponseField name="{sample}.filtered.bam.bai" type="file">
+      BAM index placed alongside the filtered BAM by `samtools_index_post_filter`.
+    </ResponseField>
+  </Expandable>
+</ResponseField>
+
+<ResponseField name="results/post_alignment/tn5_shift/" type="directory">
+  Tn5-transposase-corrected BAMs — the primary analysis BAM for peak calling and visualisation.
+
+  <Expandable title="Key files">
+    <ResponseField name="{sample}.filtered.shifted.bam" type="file">
+      BAM with reads shifted +4 bp (forward strand) and −5 bp (reverse strand) to correct for Tn5 insertion bias. Input to MACS2, FRiP calculation, TSS enrichment, and coverage tracks.
+    </ResponseField>
+    <ResponseField name="{sample}.filtered.shifted.bam.bai" type="file">
+      BAM index.
+    </ResponseField>
+  </Expandable>
+</ResponseField>
+
+<ResponseField name="results/post_alignment/mito-ATAC/" type="directory">
+  Mitochondrial read fraction statistics produced before deduplication.
+
+  <Expandable title="Key files">
+    <ResponseField name="{sample}_mito_stats.txt" type="file">
+      Tab-separated file containing total read count and mitochondrial read fraction for each sample.
+    </ResponseField>
+  </Expandable>
+</ResponseField>
+
+<ResponseField name="results/post_alignment/samtools_stats/" type="directory">
+  Raw `samtools stats` output files consumed by the QC gate.
+
+  <Expandable title="Key files">
+    <ResponseField name="{sample}_samtools_stats.txt" type="file">
+      Full `samtools stats` output. The QC gate script extracts `sequences`, `reads duplicated`, and `percentage of properly paired reads` from the `SN` section.
+    </ResponseField>
+  </Expandable>
+</ResponseField>
+
+---
+
+## Metrics & QC
+
+<ResponseField name="results/metrics_qc/tss_enrichment/" type="directory">
+  TSS enrichment scores computed by `tss_enrichment.R`.
+
+  <Expandable title="Key files">
+    <ResponseField name="{sample}_tss_enrichment.txt" type="file">
+      Tab-separated file with two columns: sample name and TSS enrichment score. Consumed by `parse_qc_metrics.py`.
+    </ResponseField>
+    <ResponseField name="{sample}_tss_enrichment.pdf" type="file">
+      TSS enrichment profile plot (signal ± 2 kb around TSSes).
+    </ResponseField>
+  </Expandable>
+</ResponseField>
+
+<ResponseField name="results/metrics_qc/picard/" type="directory">
+  Picard tool outputs for alignment and insert-size QC.
+
+  <Expandable title="Key files">
+    <ResponseField name="CollectAlignmentSummaryMetrics/{sample}.alignment_summary_metrics" type="file">
+      Picard alignment summary: total reads, mapped rate, strand balance, and chimeric read fraction.
+    </ResponseField>
+    <ResponseField name="CollectInsertSizeMetrics/{sample}.insert_size_metrics" type="file">
+      Picard insert-size summary statistics, including median insert size and mean insert size.
+    </ResponseField>
+    <ResponseField name="CollectInsertSizeMetrics/{sample}.insert_size_histogram.pdf" type="file">
+      Insert-size frequency histogram PDF showing nucleosome banding pattern.
+    </ResponseField>
+  </Expandable>
+</ResponseField>
+
+<ResponseField name="results/metrics_qc/cross_correlation/" type="directory">
+  NSC/RSC strand cross-correlation outputs from phantompeakqualtools.
+
+  <Expandable title="Key files">
+    <ResponseField name="{sample}_crosscorr.txt" type="file">
+      Tab-separated file containing NSC, RSC, estimated fragment length, and phantom peak shift.
+    </ResponseField>
+    <ResponseField name="{sample}_crosscorr.pdf" type="file">
+      Cross-correlation profile plot.
+    </ResponseField>
+  </Expandable>
+</ResponseField>
+
+<ResponseField name="results/metrics_qc/fragment_size_analysis/" type="directory">
+  Fragment size distribution plots and summary statistics.
+
+  <Expandable title="Key files">
+    <ResponseField name="{sample}_fragment_sizes.pdf" type="file">
+      Histogram of fragment size distribution with nucleosomal banding annotations.
+    </ResponseField>
+    <ResponseField name="{sample}_fragment_stats.txt" type="file">
+      Summary statistics (NFR fraction, mono-nucleosomal fraction, di-nucleosomal fraction).
+    </ResponseField>
+  </Expandable>
+</ResponseField>
+
+---
+
+## QC Gate
+
+<ResponseField name="results/qc_gate/" type="directory">
+  Per-sample pass/fail trigger files and structured QC data. Downstream rules require `{sample}_qc_pass.txt` as an explicit Snakemake input.
+
+  <Expandable title="Key files">
+    <ResponseField name="{sample}_qc_pass.txt" type="file">
+      Single-line trigger file: `{sample}\tPASSED` or `{sample}\tFAILED`. Snakemake uses this file as a dependency checkpoint for all downstream rules.
+    </ResponseField>
+    <ResponseField name="{sample}_qc_pass.json" type="file">
+      Structured JSON QC report containing per-metric values, targets, and statuses. See the [QC Thresholds reference](/reference/qc-thresholds) for the full schema.
+    </ResponseField>
+  </Expandable>
+</ResponseField>
+
+---
+
+## Peak Calling
+
+<ResponseField name="results/peak_calling/macs2_peakcall/" type="directory">
+  Raw peak calls from MACS2.
+
+  <Expandable title="Key files">
+    <ResponseField name="{sample}_peaks.narrowPeak" type="file">
+      ENCODE narrowPeak format: chromosome, start, end, name, score, strand, fold-change, −log₁₀(p-value), −log₁₀(q-value), summit offset.
+    </ResponseField>
+    <ResponseField name="{sample}_summits.bed" type="file">
+      Single-base-pair peak summits BED file.
+    </ResponseField>
+    <ResponseField name="{sample}_peaks.xls" type="file">
+      MACS2 peak spreadsheet with extended statistics.
+    </ResponseField>
+  </Expandable>
+</ResponseField>
+
+<ResponseField name="results/peak_calling/filtered_peaks/" type="directory">
+  Blacklist-filtered peaks — the primary peak set used by all downstream analyses.
+
+  <Expandable title="Key files">
+    <ResponseField name="{sample}_filtered_peaks.bed" type="file">
+      narrowPeak file with ENCODE blacklist regions removed. Input to FRiP calculation, heatmap, peak annotation, motif analysis, and TOBIAS.
+    </ResponseField>
+  </Expandable>
+</ResponseField>
+
+<ResponseField name="results/peak_calling/frip_calculation/" type="directory">
+  FRiP score output files consumed by the QC gate.
+
+  <Expandable title="Key files">
+    <ResponseField name="{sample}_frip.txt" type="file">
+      Tab-separated file: sample name and FRiP score (e.g., `SAMPLE\t0.342`).
+    </ResponseField>
+  </Expandable>
+</ResponseField>
+
+<ResponseField name="results/peak_calling/idr/" type="directory">
+  Irreproducible Discovery Rate outputs for replicate concordance analysis.
+
+  <Expandable title="Subdirectories">
+    <ResponseField name="idr_peaks/{condition}_rep{N}_rep{M}_idr_peaks.bed" type="file">
+      Peaks passing the IDR threshold (default 0.05) between replicate pairs.
+    </ResponseField>
+    <ResponseField name="optimal_peaks/{condition}_optimal_peaks.bed" type="file">
+      Final optimal peak set selected by the IDR analysis.
+    </ResponseField>
+    <ResponseField name="plots/{condition}_rep{N}_rep{M}_idr_plot.png" type="file">
+      IDR diagnostic scatter plot.
+    </ResponseField>
+  </Expandable>
+</ResponseField>
+
+<ResponseField name="results/peak_calling/consensus_peaks/" type="directory">
+  Multi-sample merged consensus peak set.
+
+  <Expandable title="Key files">
+    <ResponseField name="consensus_peaks.bed" type="file">
+      Non-redundant consensus peak set merging peaks present in at least `min_samples` (default: 2) samples, with peaks within `merge_distance` (default: 100 bp) collapsed.
+    </ResponseField>
+    <ResponseField name="peak_sample_counts.txt" type="file">
+      Tab-separated matrix showing how many samples each consensus peak was called in.
+    </ResponseField>
+  </Expandable>
+</ResponseField>
+
+<ResponseField name="results/peak_calling/count_peaks/" type="directory">
+  Read count matrix over consensus peaks for DESeq2 input.
+
+  <Expandable title="Key files">
+    <ResponseField name="peak_counts.tsv" type="file">
+      Tab-separated count matrix: rows are consensus peaks, columns are samples.
+    </ResponseField>
+  </Expandable>
+</ResponseField>
+
+<ResponseField name="results/peak_calling/differential_accessibility/" type="directory">
+  DESeq2-based differential chromatin accessibility results.
+
+  <Expandable title="Key files">
+    <ResponseField name="diff_accessibility_results.tsv" type="file">
+      Full DESeq2 results table: peak coordinates, base mean, log₂FC, standard error, Wald statistic, p-value, and adjusted p-value (FDR).
+    </ResponseField>
+    <ResponseField name="plots/volcano_plot.pdf" type="file">
+      Volcano plot: −log₁₀(FDR) vs log₂ fold-change, with significant peaks highlighted.
+    </ResponseField>
+    <ResponseField name="plots/ma_plot.pdf" type="file">
+      MA plot: log₂FC vs mean accessibility, coloured by significance.
+    </ResponseField>
+    <ResponseField name="plots/pca_plot.pdf" type="file">
+      PCA of variance-stabilised count data across all samples.
+    </ResponseField>
+  </Expandable>
+</ResponseField>
+
+<ResponseField name="results/peak_calling/tobias/" type="directory">
+  TOBIAS bias-corrected TF footprinting results.
+
+  <Expandable title="Subdirectories">
+    <ResponseField name="corrected_bw/{sample}_corrected.bw" type="file">
+      Tn5 bias-corrected ATAC-seq signal BigWig (ATACorrect output).
+    </ResponseField>
+    <ResponseField name="footprint_bw/{sample}_footprints.bw" type="file">
+      TOBIAS footprint score BigWig (ScoreBigwig output).
+    </ResponseField>
+    <ResponseField name="bindetect/" type="directory">
+      BINDetect output directory: per-TF binding scores, differential binding plots, and a summary table across conditions.
+    </ResponseField>
+  </Expandable>
+</ResponseField>
+
+<ResponseField name="results/peak_calling/footprinting/" type="directory">
+  HINT-ATAC footprint calls via the RGT toolkit.
+
+  <Expandable title="Key files">
+    <ResponseField name="{sample}_footprints.bed" type="file">
+      BED file of predicted TF-bound footprint regions.
+    </ResponseField>
+  </Expandable>
+</ResponseField>
+
+<ResponseField name="results/peak_calling/chromvar/" type="directory">
+  chromVAR TF motif accessibility deviation scores.
+
+  <Expandable title="Subdirectories">
+    <ResponseField name="deviations/" type="directory">
+      Raw chromVAR deviation score matrices per TF motif (RDS and TSV formats).
+    </ResponseField>
+    <ResponseField name="bias_corrected/" type="directory">
+      GC-bias-corrected deviation scores.
+    </ResponseField>
+    <ResponseField name="plots/" type="directory">
+      Heatmaps and variability plots of TF deviation scores across samples.
+    </ResponseField>
+  </Expandable>
+</ResponseField>
+
+<ResponseField name="results/peak_calling/peak_annotation/" type="directory">
+  Genomic feature annotations for filtered peaks.
+
+  <Expandable title="Key files">
+    <ResponseField name="{sample}_peak_annotation.txt" type="file">
+      HOMER or ChIPseeker annotation table: peak coordinates + nearest gene, genomic feature category (promoter, intron, exon, intergenic), distance to TSS.
+    </ResponseField>
+  </Expandable>
+</ResponseField>
+
+<ResponseField name="results/peak_calling/motif_analysis/" type="directory">
+  HOMER de novo and known motif enrichment results per sample.
+
+  <Expandable title="Key files">
+    <ResponseField name="{sample}/homerResults.html" type="file">
+      HOMER de novo motif enrichment results page.
+    </ResponseField>
+    <ResponseField name="{sample}/knownResults.html" type="file">
+      HOMER known motif enrichment results page.
+    </ResponseField>
+  </Expandable>
+</ResponseField>
+
+---
+
+## scATAC-seq Outputs
+
+<ResponseField name="results/scatac/archr/" type="directory">
+  ArchR single-cell ATAC-seq analysis outputs. Only generated when `global.mode: "scatac"`.
+
+  <Expandable title="Subdirectories">
+    <ResponseField name="arrow/" type="directory">
+      Raw ArchR Arrow files (one per sample), containing per-cell fragment matrices and metadata.
+    </ResponseField>
+    <ResponseField name="filtered_arrow/" type="directory">
+      Arrow files after doublet removal and cell QC filtering (`min_tss: 4.0`, `min_frags: 1000`, `max_frags: 100000`).
+    </ResponseField>
+    <ResponseField name="clusters/cell_clusters.tsv" type="file">
+      Tab-separated file mapping each cell barcode to its Leiden cluster assignment.
+    </ResponseField>
+    <ResponseField name="plots/umap_clusters.pdf" type="file">
+      UMAP embedding coloured by cluster identity.
+    </ResponseField>
+    <ResponseField name="markers/marker_genes.tsv" type="file">
+      Differentially accessible peaks and marker genes per cluster.
+    </ResponseField>
+    <ResponseField name="doublets/doublet_enrichment.pdf" type="file">
+      Doublet enrichment score distribution used to set the `doublet_threshold: 0.2` cutoff.
+    </ResponseField>
+  </Expandable>
+</ResponseField>
+
+<ResponseField name="results/scatac/cicero/" type="directory">
+  Cicero chromatin co-accessibility outputs.
+
+  <Expandable title="Subdirectories">
+    <ResponseField name="connections/coaccessibility_connections.rds" type="file">
+      R RDS file containing the full co-accessibility connection object from Cicero.
+    </ResponseField>
+    <ResponseField name="connections/coaccessibility_table.tsv" type="file">
+      Tab-separated connection table: Peak1, Peak2, co-accessibility score (0–1).
+    </ResponseField>
+    <ResponseField name="ccans/ccans.bed" type="file">
+      BED file of identified Cis-Co-Accessibility Networks (CCANs).
+    </ResponseField>
+  </Expandable>
+</ResponseField>
+
+---
+
+## Visualization
+
+<ResponseField name="results/visualization/bigwig/" type="directory">
+  Raw signal BigWig files converted from sorted bedGraph.
+
+  <Expandable title="Key files">
+    <ResponseField name="{sample}.bw" type="file">
+      BigWig coverage track from the Tn5-shifted BAM, for genome browser loading and deepTools analysis.
+    </ResponseField>
+  </Expandable>
+</ResponseField>
+
+<ResponseField name="results/visualization/normalized_coverage/" type="directory">
+  CPM-normalised BigWig tracks for cross-sample comparability.
+
+  <Expandable title="Key files">
+    <ResponseField name="{sample}_CPM.bw" type="file">
+      Counts Per Million normalised BigWig, produced by `bamCoverage --normalizeUsing CPM`.
+    </ResponseField>
+  </Expandable>
+</ResponseField>
+
+<ResponseField name="results/visualization/heatmap/" type="directory">
+  deepTools heatmap plots and data matrices centred on filtered peaks.
+
+  <Expandable title="Key files">
+    <ResponseField name="plot/{sample}_tss_heatmap.pdf" type="file">
+      Read-density heatmap PDF, ±3 kb around peak centres, coloured by `coolwarm` palette.
+    </ResponseField>
+    <ResponseField name="matrix/{sample}_heatmap_matrix.gz" type="file">
+      Compressed deepTools matrix file for replotting or downstream analysis.
+    </ResponseField>
+  </Expandable>
+</ResponseField>
+
+<ResponseField name="results/visualization/correlation_analysis/" type="directory">
+  Inter-sample BigWig correlation analysis outputs.
+
+  <Expandable title="Key files">
+    <ResponseField name="correlation_heatmap.pdf" type="file">
+      Pearson/Spearman correlation heatmap across all samples.
+    </ResponseField>
+    <ResponseField name="correlation_matrix.tab" type="file">
+      Raw correlation coefficient matrix in tab-separated format.
+    </ResponseField>
+  </Expandable>
+</ResponseField>
+
+---
+
+## Reporting
+
+<ResponseField name="results/reporting/multiqc/" type="directory">
+  Consolidated MultiQC report aggregating all tool QC outputs.
+
+  <Expandable title="Key files">
+    <ResponseField name="multiqc_report.html" type="file">
+      Interactive HTML report combining fastp, FastQC, Picard, samtools, Qualimap, preseq, and QC gate metrics across all samples.
+    </ResponseField>
+    <ResponseField name="multiqc_data/" type="directory">
+      Raw JSON and TSV data files extracted by MultiQC for programmatic use.
+    </ResponseField>
+  </Expandable>
+</ResponseField>
+
+<ResponseField name="results/reporting/pipeline_execution_summary.json" type="file">
+  Structured JSON summary written by the Snakemake `onsuccess` lifecycle hook. Contains run metadata, sample list, mode, and completion timestamp. Consumed by `atacseq_tool.py` to return a structured status string to AI agents.
+</ResponseField>
+
+<ResponseField name="results/reporting/benchmark_summary.tsv" type="file">
+  Aggregated benchmark table produced by the `benchmark_summary` rule. Columns include rule name, sample, wall-clock time (seconds), CPU time (seconds), and peak memory (MB) drawn from individual `benchmarks/*.txt` files.
+</ResponseField>
+
+---
+
+## Benchmarks
+
+<ResponseField name="benchmarks/" type="directory">
+  Per-rule, per-sample Snakemake benchmark files in tab-separated format.
+
+  Each file records: `s` (wall-clock seconds), `h:m:s` (human-readable time), `max_rss` (peak RSS memory in MB), `max_vms`, `max_uss`, `max_pss`, `io_in`, `io_out`, `mean_load`, `cpu_time`.
+
+  ```
+  benchmarks/
+  ├── fastp/{sample}.txt
+  ├── bowtie2/{sample}.txt
+  ├── samtools_markdup/{sample}.txt
+  ├── macs2/{sample}.txt
+  ├── idr/{condition}_rep{N}_rep{M}.txt
+  └── multiqc/multiqc.txt
+  ```
+</ResponseField>
+
+---
+
+## Logs
+
+<ResponseField name="logs/" type="directory">
+  Per-rule, per-sample stderr and stdout log files. Log file extensions follow the global convention: `.err` for stderr, `.log` for combined output.
+
+  ```
+  logs/
+  ├── fastp/{sample}.log
+  ├── bowtie2/{sample}.log
+  ├── samtools_markdup/{sample}.log
+  ├── qc_gate/{sample}.log
+  ├── macs2/{sample}.log
+  └── multiqc/multiqc.log
+  ```
+</ResponseField>

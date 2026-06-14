@@ -1,0 +1,241 @@
+---
+title: "ATAC-seq QC Gate: Thresholds, Tiers, and Fallbacks"
+sidebarTitle: "QC Gating"
+description: "How parse_qc_metrics.py applies PASS/WARN/FAIL tiers across four metrics, produces MultiQC-ready JSON, and gracefully handles failing samples."
+---
+
+High-quality ATAC-seq data is non-negotiable before peak calling and differential-accessibility analysis — a sample with poor TSS enrichment or low fraction of reads in peaks will produce noisy, unreproducible results that corrupt every downstream conclusion. The BDB-Genomics pipeline therefore implements a hard QC gate that runs after the post-alignment filtering chain and before any peak-calling jobs are scheduled. The gate evaluates four numeric thresholds per sample, assigns each metric a three-tier status (PASS / WARN / FAIL), writes a human-readable text report and a machine-readable JSON, and signals to Snakemake via a sentinel file whether the sample may proceed. Critically, failing samples are **not** crashed — the pipeline documents the failure and gracefully bypasses expensive downstream rules to save compute time.
+
+## The Four Thresholds
+
+All thresholds are declared in `config.yaml` under `qc_gate.params` and can be overridden on the command line without modifying any source file:
+
+```yaml
+# config.yaml
+qc_gate:
+  input:
+    frip:  "results/peak_calling/frip_calculation"
+    tss:   "results/metrics_qc/tss_enrichment"
+    stats: "results/post_alignment/samtools_stats"
+  output: "results/qc_gate"
+  params:
+    min_frip:          0.2    # Fraction of Reads in Peaks ≥ 0.2
+    min_tss_enr:       7.0    # TSS Enrichment score ≥ 7.0
+    min_mapping_rate:  80.0   # % properly paired reads ≥ 80%
+    max_duplicate_rate: 20.0  # % PCR/optical duplicates ≤ 20%
+  threads: 1
+  resources:
+    mem_mb: 1000
+    time: 10
+```
+
+| Metric | Config Key | Threshold | Direction |
+|---|---|---|---|
+| FRiP Score | `min_frip` | ≥ 0.2 | Higher is better |
+| TSS Enrichment | `min_tss_enr` | ≥ 7.0 | Higher is better |
+| Mapping Rate | `min_mapping_rate` | ≥ 80.0 % | Higher is better |
+| Duplicate Rate | `max_duplicate_rate` | ≤ 20.0 % | Lower is better |
+
+## What `parse_qc_metrics.py` Does
+
+The gate is implemented entirely in `rules/scripts/parse_qc_metrics.py`. The Snakemake rule calls it with all four input files and all four threshold values:
+
+```bash
+# rules/qc_gate.smk (shell block)
+python3 rules/scripts/parse_qc_metrics.py \
+    --sample {wildcards.sample} \
+    --frip-file  {input.frip} \
+    --tss-file   {input.tss} \
+    --stats-file {input.stats} \
+    --min-frip           {params.min_frip} \
+    --min-tss            {params.min_tss} \
+    --min-mapping-rate   {params.min_mapping_pt} \
+    --max-duplicate-rate {params.max_dup_pt} \
+    --log        {log} \
+    --output     {output.pass_file} \
+    --json-output {output.pass_json}
+```
+
+<Steps>
+  <Step title="Parse FRiP">
+    Reads `{sample}_frip.txt` (produced by `frip_calculation`). Handles both single-column and TSV formats, and skips header lines that contain the word "sample":
+
+    ```python
+    def parse_frip(frip_path):
+        with open(frip_path) as f:
+            lines = [l.strip() for l in f if l.strip()]
+        target = lines[1] if len(lines) > 1 and "sample" in lines[0].lower() else lines[0]
+        parts = target.split('\t')
+        return float(parts[0]) if len(parts) == 1 else float(parts[1])
+    ```
+  </Step>
+  <Step title="Parse TSS Enrichment">
+    Reads `{sample}_tss_enrichment.txt` produced by the `tss_enrichment.R` script. Handles both headered and headerless TSV outputs from the ATACseqQC R package.
+  </Step>
+  <Step title="Parse samtools stats">
+    Reads `{sample}_postFiltering.stats.txt`. Uses a key-based mapping over `SN`-prefixed lines to extract `sequences` (total reads), `percentage of properly paired reads` (mapping rate), and `reads duplicated`:
+
+    ```python
+    mapping = {
+        "sequences":                               "total_reads",
+        "properly paired":                         "mapped_properly_count",
+        "percentage of properly paired reads":     "mapped_properly",
+        "reads duplicated":                        "duplicates"
+    }
+    ```
+
+    Duplicate rate is derived as `(duplicates / total_reads) × 100`.
+  </Step>
+  <Step title="Apply Thresholds and Assign Tiers">
+    Each metric is evaluated against its threshold. If a parsed value is `None` (file not found or parse failure), it is set to `0` and the overall result is forced to `FAILED`.
+  </Step>
+</Steps>
+
+## PASS / WARN / FAIL Tiers
+
+The script applies a **10% advisory buffer** around each threshold. Metrics that pass the hard threshold but fall within 10% of it receive a `WARN` status instead of `PASS`, alerting operators to borderline samples before they become problems in a larger cohort.
+
+```python
+def check(metric, val, target, operator='>='):
+    # 10% warning buffer
+    warn_threshold = target * 1.1 if operator == '<=' else target * 0.9
+
+    if (operator == '>=' and val < target) or (operator == '<=' and val > target):
+        # Hard failure
+        qc_data["metrics"][metric]["status"] = "FAIL"
+        qc_data["overall"] = "FAILED"
+    elif (operator == '>=' and val < warn_threshold) or (operator == '<=' and val > warn_threshold):
+        # Borderline warning
+        qc_data["metrics"][metric]["status"] = "WARN"
+    # else: PASS — no change needed
+```
+
+| Status | Condition (FRiP example, threshold = 0.2) |
+|---|---|
+| **PASS** | FRiP ≥ 0.22 (above 110% of threshold) |
+| **WARN** | 0.18 ≤ FRiP < 0.22 (between 90–110% of threshold) |
+| **FAIL** | FRiP < 0.18 (below threshold) |
+
+The `overall` status is `PASSED` only if all four metrics individually pass (no `FAIL`). A sample with any `WARN` still gets an overall `PASSED`.
+
+## Output Files
+
+Two files are written per sample to `results/qc_gate/`:
+
+<Tabs>
+  <Tab title="{sample}_qc_pass.txt">
+    A tab-separated sentinel file consumed by downstream Snakemake rules to decide whether to run expensive jobs:
+
+    ```
+    sample_name	PASSED
+    ```
+
+    or
+
+    ```
+    sample_name	FAILED
+    ```
+  </Tab>
+  <Tab title="{sample}_qc_pass.json">
+    A structured JSON consumed by MultiQC for dashboard integration:
+
+    ```json
+    {
+        "sample": "ENCSR356KRQ_rep1",
+        "metrics": {
+            "frip":       { "val": 0.312, "target": 0.2,  "status": "PASS" },
+            "tss":        { "val": 8.74,  "target": 7.0,  "status": "PASS" },
+            "mapping":    { "val": 96.2,  "target": 80.0, "status": "PASS" },
+            "duplicates": { "val": 11.3,  "target": 20.0, "status": "PASS" }
+        },
+        "overall": "PASSED"
+    }
+    ```
+  </Tab>
+</Tabs>
+
+## Graceful Fallback: Failing Samples Are Not Crashed
+
+The pipeline is designed so that a failing QC gate **never halts the entire run**. The script exits with code `0` even when the overall result is `FAILED`:
+
+```python
+if qc_data["overall"] == "FAILED":
+    sys.exit(0)   # non-zero would crash Snakemake
+```
+
+Downstream rules that perform expensive computation (heatmaps, peak annotation, TOBIAS) check the `_qc_pass.txt` sentinel in their input block. If the file records `FAILED`, the rule is still triggered (Snakemake demands the output of `qc_gate`), but the rule's script reads the file and returns immediately with a dummy output rather than running full analysis.
+
+## Graceful Fallback: Zero-Peak Samples
+
+A sample may pass the QC gate but yield zero peaks after blacklist filtering — for example, when the library covers a very restricted region or when a test dataset is used. Rather than crashing rules that expect non-empty BED files, every downstream rule (ChIPseeker annotation, heatmap, TOBIAS BINDetect, HOMER motif analysis) detects the empty input and generates **valid dummy outputs**:
+
+<Accordion title="Example: HOMER motif analysis fallback">
+```bash
+# rules/motif_analysis.smk
+if [ ! -s {input.filtered_peaks} ] || [ $(wc -l < {input.filtered_peaks}) -eq 0 ]; then
+    mkdir -p {output.html}
+    echo "<html><body>No peaks found for motif analysis.</body></html>" \
+        > {output.html}/homerResults.html
+    touch {output.html}/homerResults.txt
+    touch {output.html}/knownResults.txt
+else
+    findMotifsGenome.pl {input.filtered_peaks} ...
+fi
+```
+</Accordion>
+
+<Accordion title="Example: ChIPseeker peak annotation fallback">
+```r
+# Inline R in rules/peak_annotation.smk
+if (is_empty) {
+    dummy_anno <- data.frame(
+        seqnames=character(), start=integer(), end=integer(),
+        annotation=character(), distanceToTSS=numeric()
+    )
+    write.table(dummy_anno, output_file, sep="\t", row.names=FALSE)
+} else {
+    # real ChIPseeker annotation
+    txdb <- makeTxDbFromGFF(params.gff, format="gtf")
+    peakAnno <- annotatePeak(peakfile, TxDb=txdb, tssRegion=c(-3000, 3000))
+    ...
+}
+```
+</Accordion>
+
+## Tuning Thresholds
+
+### Adjusting for Your Data
+
+Tissue-specific ATAC-seq libraries (e.g., FFPE material, frozen biopsies) may have legitimately lower TSS enrichment. To relax a threshold, edit `config.yaml`:
+
+```yaml
+qc_gate:
+  params:
+    min_tss_enr: 4.0   # relaxed for FFPE samples
+```
+
+### Disabling the Gate Temporarily
+
+For CI testing with synthetic data or when rapid iteration is needed, disable every threshold with a command-line override file:
+
+```yaml
+# custom_override.yaml
+qc_gate:
+  params:
+    min_frip: 0.0
+    min_tss_enr: 0.0
+    min_mapping_rate: 0.0
+    max_duplicate_rate: 100.0
+```
+
+```bash
+snakemake --configfile config.yaml custom_override.yaml --cores 8
+```
+
+<Warning>
+  The `test` execution profile under `profile/test/` already ships with relaxed QC thresholds for synthetic CI datasets. Avoid permanently lowering thresholds in the main `config.yaml` — use override files or profiles instead so the defaults remain a meaningful quality bar for production runs.
+</Warning>
+
+## MultiQC Integration
+
+The `{sample}_qc_pass.json` files are passed directly to `multiqc` as inputs. MultiQC's custom-content module parses them and renders a QC-gate summary table inside the final `multiqc_report.html`. No custom MultiQC plugin is needed — the pipeline's `rules/config/multiqc_config.yaml` configures the JSON schema parsing.

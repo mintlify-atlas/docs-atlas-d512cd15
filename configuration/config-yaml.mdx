@@ -1,0 +1,434 @@
+---
+title: "config.yaml — Pipeline Configuration Reference"
+sidebarTitle: "Config YAML"
+description: "Comprehensive reference for the BDB-Genomics ATAC-seq config.yaml: global references, YAML anchors, per-tool schemas, and runtime overrides."
+---
+
+The `config.yaml` file is the **single source of truth** for every parameter in the BDB-Genomics ATAC-seq pipeline. Every tool path, resource limit, QC threshold, and reference genome pointer is declared here. Snakemake rules are intentionally stateless — they read from this config at runtime and contain no hard-coded values. This separation means you can tune, extend, or override any aspect of the pipeline without ever touching a rule file.
+
+## YAML Anchors
+
+The config uses YAML anchors (`&NAME`) and aliases (`*NAME`) to centralise all reference file paths. A path is declared exactly once and then referenced everywhere it is needed. Changing a genome build is therefore a single-line edit.
+
+```yaml
+global:
+  references:
+    genome_fa:      &GENOME_FA      "data/reference/genome.fa"
+    genome_sizes:   &GENOME_SIZES   "data/reference/genome.chrom.sizes"
+    bowtie2_index:  &BOWTIE2_INDEX  "data/reference/index/genome"
+    chromap_index:  &CHROMAP_INDEX  "data/reference/chromap/genome.index"
+    blacklist:      &BLACKLIST       "data/reference/ENCODE_blacklist.bed"
+    annotation_gtf: &ANNOTATION_GTF "data/reference/annotation.gtf"
+    motif_db:       &MOTIF_DB       "data/motifs/jaspar_vertebrates.meme"
+```
+
+Downstream tool blocks dereference these anchors with the `*` alias syntax:
+
+```yaml
+bowtie2:
+  params:
+    index: *BOWTIE2_INDEX   # expands to "data/reference/index/genome"
+
+remove_blacklist_reads:
+  input:
+    blacklist: *BLACKLIST    # expands to "data/reference/ENCODE_blacklist.bed"
+```
+
+<Tip>
+  All seven anchor names — `&GENOME_FA`, `&GENOME_SIZES`, `&BOWTIE2_INDEX`, `&CHROMAP_INDEX`, `&BLACKLIST`, `&ANNOTATION_GTF`, and `&MOTIF_DB` — are validated by `validate_config.py` at startup. A missing or inaccessible path fails the run before the DAG is built.
+</Tip>
+
+---
+
+## The `global` Section
+
+The `global` block holds project-wide settings and the reference file registry.
+
+<ParamField path="global.mode" type="string" default="bulk">
+  Pipeline modality. Accepted values: `"bulk"` or `"scatac"`. Can be overridden at runtime with the `ATAC_MODE` environment variable without editing this file.
+</ParamField>
+
+<ParamField path="global.samples" type="string" required>
+  Relative path to the TSV sample sheet. Resolved relative to the config file's directory, then the workflow root, then the current working directory.
+</ParamField>
+
+<ParamField path="global.references.genome_fa" type="string" required>
+  Path to the reference FASTA. Used by Picard alignment metrics, peak annotation, TOBIAS, chromVAR, and footprinting.
+</ParamField>
+
+<ParamField path="global.references.genome_sizes" type="string" required>
+  Two-column chromosome sizes file (chromosome name, length in bp). Required by `bedGraphToBigWig` and TOBIAS.
+</ParamField>
+
+<ParamField path="global.references.bowtie2_index" type="string" required>
+  Bowtie2 index prefix (bulk mode). The validator checks for `.bt2` or `.bt2l` files matching this prefix.
+</ParamField>
+
+<ParamField path="global.references.chromap_index" type="string" required>
+  Chromap index file path (scATAC-seq mode only).
+</ParamField>
+
+<ParamField path="global.references.blacklist" type="string" required>
+  ENCODE blacklist BED file. Applied during post-alignment filtering and again during peak blacklist filtering.
+</ParamField>
+
+<ParamField path="global.references.annotation_gtf" type="string" required>
+  GTF annotation file used for TSS enrichment scoring and peak annotation.
+</ParamField>
+
+<ParamField path="global.references.motif_db" type="string" required>
+  MEME-format motif database (e.g., JASPAR vertebrates). Used by motif analysis, TOBIAS, and chromVAR.
+</ParamField>
+
+---
+
+## Per-Tool Block Schema
+
+Every tool block in the config follows a uniform five-field schema. This consistency makes the config self-documenting and allows the validation script to discover required keys automatically by scanning rule files.
+
+```
+<tool_name>:
+  input:   ...   # source directory or file path(s)
+  output:  ...   # destination directory
+  params:  ...   # tool-specific flags and thresholds
+  threads: ...   # CPU allocation (positive integer)
+  resources:     # scheduler resource requests
+    mem_mb: ...  # memory in megabytes (positive integer)
+    time:   ...  # wall-clock limit in minutes (positive integer)
+```
+
+<Note>
+  `fastp` is the only tool without an `input` key — raw FASTQ paths are resolved dynamically from the sample sheet at runtime.
+</Note>
+
+### Preprocessing
+
+<Accordion title="fastp">
+
+```yaml
+fastp:
+  output: "results/preprocessing/fastp"
+  params:
+    trim_front1: 5
+    trim_front2: 5
+    length_required: 30
+  threads: 4
+  resources:
+    mem_mb: 8000
+    time: 120
+```
+
+</Accordion>
+
+<Accordion title="fastqc">
+
+```yaml
+fastqc:
+  input:
+    R1: "results/preprocessing/fastp"
+    R2: "results/preprocessing/fastp"
+  output: "results/preprocessing/fastqc"
+  threads: 4
+  resources:
+    mem_mb: 2000
+    time: 30
+```
+
+</Accordion>
+
+### Alignment
+
+<Accordion title="bowtie2">
+
+```yaml
+bowtie2:
+  input: "results/preprocessing/fastp"
+  output: "results/alignment/bowtie2"
+  params:
+    index: *BOWTIE2_INDEX
+    sensitive: "--very-sensitive"
+  threads: 8
+  resources:
+    mem_mb: 16000
+    time: 240
+```
+
+</Accordion>
+
+### Post-alignment
+
+Key post-alignment tools and their defaults:
+
+<Accordion title="samtools_markdup">
+
+```yaml
+samtools_markdup:
+  input:
+    sorted_bam_noMT_fixmate: "results/post_alignment/samtools_fixmate"
+  output:
+    markdup_bam: "results/post_alignment/samtools_markdup"
+  params:
+    remove_duplicates: false
+  threads: 4
+  resources:
+    mem_mb: 8000
+    time: 120
+```
+
+</Accordion>
+
+<Accordion title="samtools_view (MAPQ + flag filtering)">
+
+```yaml
+samtools_view:
+  input:
+    noMT_sorted_bam: "results/post_alignment/remove_mito_reads"
+  output:
+    filtered_bam: "results/post_alignment/samtools_view"
+  params:
+    MAPQ: 30
+    flags: 3844
+  threads: 2
+  resources:
+    mem_mb: 2000
+    time: 30
+```
+
+</Accordion>
+
+<Accordion title="tn5_shift">
+
+```yaml
+tn5_shift:
+  input:
+    filtered_bam: "results/post_alignment/samtools_view"
+  output:
+    shifted_bam: "results/post_alignment/tn5_shift"
+    shifted_bam_index: "results/post_alignment/tn5_shift"
+  threads: 4
+  resources:
+    mem_mb: 4000
+    time: 60
+```
+
+</Accordion>
+
+### QC Gate
+
+The QC gate block is the most commonly tuned section. It gates downstream peak calling and visualisation on four per-sample thresholds:
+
+```yaml
+qc_gate:
+  input:
+    frip: "results/peak_calling/frip_calculation"
+    tss:  "results/metrics_qc/tss_enrichment"
+    stats: "results/post_alignment/samtools_stats"
+  output: "results/qc_gate"
+  params:
+    min_frip:           0.2
+    min_tss_enr:        7.0
+    min_mapping_rate:   80.0
+    max_duplicate_rate: 20.0
+  threads: 1
+  resources:
+    mem_mb: 1000
+    time: 10
+```
+
+<ParamField path="qc_gate.params.min_frip" type="float" default="0.2">
+  Minimum Fraction of Reads in Peaks. Samples below this threshold are flagged as failing QC. Must be a non-negative float.
+</ParamField>
+
+<ParamField path="qc_gate.params.min_tss_enr" type="float" default="7.0">
+  Minimum TSS enrichment score. A score ≥ 7 is considered high quality for bulk ATAC-seq.
+</ParamField>
+
+<ParamField path="qc_gate.params.min_mapping_rate" type="float" default="80.0">
+  Minimum overall mapping rate (%) from samtools stats.
+</ParamField>
+
+<ParamField path="qc_gate.params.max_duplicate_rate" type="float" default="20.0">
+  Maximum duplicate read rate (%). Samples with higher duplication are flagged.
+</ParamField>
+
+### Peak Calling
+
+<Accordion title="macs2">
+
+```yaml
+macs2:
+  input:
+    shifted_bam: "results/post_alignment/tn5_shift"
+  output:
+    peaks: "results/peak_calling/macs2_peakcall"
+  params:
+    genome_size: "hs"
+    qvalue: 0.01
+    nomodel: "--nomodel"
+    format: "BAMPE"
+  threads: 8
+  resources:
+    mem_mb: 16000
+    time: 240
+```
+
+</Accordion>
+
+<Accordion title="idr">
+
+```yaml
+idr:
+  output:
+    idr_peaks:     "results/peak_calling/idr/idr_peaks"
+    optimal_peaks: "results/peak_calling/idr/optimal_peaks"
+    plots:         "results/peak_calling/idr/plots"
+  params:
+    idr_threshold: 0.05
+    rank_column:   "score"
+  threads: 4
+  resources:
+    mem_mb: 4000
+    time: 60
+```
+
+</Accordion>
+
+<Accordion title="consensus_peaks">
+
+```yaml
+consensus_peaks:
+  output:
+    consensus: "results/peak_calling/consensus_peaks"
+    counts:    "results/peak_calling/consensus_peaks"
+  params:
+    min_samples:     2
+    merge_distance: 100
+  threads: 4
+  resources:
+    mem_mb: 8000
+    time: 120
+```
+
+</Accordion>
+
+<Accordion title="differential_accessibility">
+
+```yaml
+differential_accessibility:
+  output:
+    results: "results/peak_calling/differential_accessibility"
+    plots:   "results/peak_calling/differential_accessibility/plots"
+  params:
+    fdr_threshold:    0.05
+    log2fc_threshold: 1.0
+  threads: 8
+  resources:
+    mem_mb: 16000
+    time: 240
+```
+
+</Accordion>
+
+### scATAC-seq Tools
+
+<Accordion title="chromap">
+
+```yaml
+chromap:
+  input: "results/preprocessing/fastp"
+  output: "results/alignment/chromap"
+  params:
+    index: *CHROMAP_INDEX
+    preset: "atac"
+  threads: 16
+  resources:
+    mem_mb: 32000
+    time: 120
+```
+
+</Accordion>
+
+<Accordion title="archr">
+
+```yaml
+archr:
+  input:
+    bam: "results/alignment/chromap"
+  output:
+    arrow:          "results/scatac/archr/arrow"
+    filtered_arrow: "results/scatac/archr/filtered_arrow"
+    fragments:      "results/scatac/archr/fragments"
+    clusters:       "results/scatac/archr/clusters"
+    markers:        "results/scatac/archr/markers"
+    doublets:       "results/scatac/archr/doublets"
+    plots:          "results/scatac/archr/plots"
+    qc_report:      "results/scatac/archr/qc_report"
+  params:
+    min_tss:                4.0
+    min_frags:              1000
+    max_frags:              100000
+    tsse_method:            "ArchR"
+    doublet_threshold:      0.2
+    clustering_resolution:  0.8
+    dims_to_use:            1:30
+    force_dim_reduction:    true
+  threads: 16
+  resources:
+    mem_mb: 64000
+    time: 240
+```
+
+</Accordion>
+
+---
+
+## Dynamic Config Overrides
+
+Snakemake supports layered config loading: values in a second `--configfile` argument override matching keys in the first. This is useful for parameter sweeps, CI testing, or per-project adjustments without modifying the canonical `config.yaml`.
+
+```bash
+snakemake --configfile config.yaml custom_override.yaml
+```
+
+### Example: Loosening QC Gate Thresholds for Synthetic Data
+
+When running the pipeline on synthetic or downsampled CI data, FRiP scores and TSS enrichment values will be well below production thresholds. Create an override file to relax these gates without altering the main config:
+
+```yaml
+# ci_override.yaml
+qc_gate:
+  params:
+    min_frip:     0.01
+    min_tss_enr:  1.0
+    min_mapping_rate: 30.0
+    max_duplicate_rate: 80.0
+```
+
+Then run:
+
+```bash
+snakemake --configfile config.yaml ci_override.yaml --profile profile/test
+```
+
+<Warning>
+  Only keys present in the override file are replaced. All other keys — including reference paths and tool parameters — remain exactly as declared in `config.yaml`. Never commit a relaxed override file as the default config.
+</Warning>
+
+---
+
+## Adding a New Tool
+
+The config ships a boilerplate template block at the bottom of `config.yaml`. Copy it, replace the placeholder names, and add the matching rule file and `include:` directive in the Snakefile:
+
+```yaml
+template_category:
+  template_tool:
+    input:  "results/preprocessing/fastp"
+    output: "results/template_category/template_tool"
+    params:
+      message: "This is a boilerplate template."
+    threads: 1
+    resources:
+      mem_mb: 1000
+      time: 10
+```

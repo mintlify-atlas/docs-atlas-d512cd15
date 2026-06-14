@@ -1,0 +1,85 @@
+---
+title: "BDB-Genomics ATAC-seq Pipeline: Introduction"
+sidebarTitle: "Introduction"
+description: "A production-grade, config-driven Snakemake framework for end-to-end chromatin accessibility analysis supporting bulk and single-cell ATAC-seq."
+---
+
+The BDB-Genomics ATAC-seq Framework is a production-grade, fully config-driven pipeline for end-to-end chromatin accessibility analysis. Built on Snakemake ≥ 8.0, it takes paired-end FASTQ files from raw reads all the way through trimming, alignment, post-alignment filtering, QC gating, peak calling, differential accessibility, and transcription-factor footprinting — without requiring any modification to the underlying rules. What sets this framework apart is its native support for both **bulk ATAC-seq** and **single-cell ATAC-seq** (scATAC-seq) from a single configuration file, switched at runtime by one environment variable. It is designed to scale transparently from a 4 GB laptop to an HPC cluster or cloud-managed Kubernetes environment, and its strict fail-fast QC gate ensures that poor-quality samples are identified and quarantined before expensive downstream computation begins.
+
+## Pipeline Architecture
+
+The framework is organized as a **six-stage directed acyclic graph (DAG)**. Each stage receives the contract outputs (BAM, BED, BigWig) of the previous stage, making individual components independently testable and replaceable.
+
+```
+Preprocessing → Alignment → Post-alignment Filtering → Metrics & QC
+                                                              ↓
+                                              Visualization ← Peak Calling
+```
+
+Every stage is governed by a uniform tool-block schema in `config.yaml` — `input → output → params → threads → resources` — so adding a new tool never requires touching existing rules.
+
+### Modality Switching: Bulk vs. scATAC-seq
+
+Setting the `ATAC_MODE` environment variable to `bulk` (default) or `scatac` selects an entirely different set of Snakemake rule includes at startup. The table below shows how each stage differs between modes:
+
+| Stage | Bulk (`bulk`) | Single-Cell (`scatac`) |
+|---|---|---|
+| **Alignment** | Bowtie2 (`--very-sensitive`) | Chromap (`--preset atac`) |
+| **Filtering** | MAPQ > 30, Fixmate, ENCODE Blacklist removal, Tn5 Shift | ArchR Arrow file creation & doublet removal |
+| **Peak Calling** | MACS2, IDR replicate concordance | ArchR marker peak identification |
+| **Co-accessibility** | — | Cicero (500 bp window, 250 kb distance) |
+| **Differential** | DESeq2 (FDR 0.05, log2FC 1.0) | ArchR cluster markers |
+| **Footprinting** | HINT-ATAC & TOBIAS BINDetect | chromVAR motif accessibility |
+
+All downstream stages — QC reporting, visualization, and benchmark auditing — remain identical across modes because they operate on standard BAM/BED/BigWig contracts.
+
+## Key Design Principles
+
+**Config-driven, never rule-driven.** Every file path, genome size, thread count, and QC threshold lives in `config.yaml`. The Snakemake rules are stateless wrappers that read from this file at runtime. You can override any parameter on the fly by supplying a second `--configfile` without touching the main configuration.
+
+**Fail-fast QC gating.** A hard QC gate (`rules/scripts/parse_qc_metrics.py`) sits between metrics collection and downstream analysis. Samples must satisfy four configurable thresholds — FRiP ≥ 0.2, TSS Enrichment ≥ 7.0, Mapping Rate ≥ 80 %, and Duplicate Rate ≤ 20 % — before peak calling proceeds. Samples that fail are documented and automatically bypassed rather than crashing the DAG.
+
+**Reproducible by construction.** Every rule declares its own Conda environment under `rules/envs/`, and Snakemake resolves and caches all tool dependencies automatically with `--use-conda`. Container directives in `.smk` rule files additionally support Singularity/Apptainer execution via Galaxy Project Biocontainers, providing bit-for-bit reproducibility across institutions.
+
+**Full auditability.** On every run — success or failure — the pipeline writes a machine-readable JSON execution summary to `results/reporting/pipeline_execution_summary.json`, capturing per-rule CPU time, peak memory, and (on failure) the last five error lines extracted from `logs/`.
+
+## Quick Navigation
+
+<CardGroup cols={2}>
+  <Card
+    title="Quickstart"
+    icon="rocket"
+    href="/quickstart"
+  >
+    Go from zero to a completed pipeline run in minutes using synthetic test data or real ENCODE samples.
+  </Card>
+  <Card
+    title="Installation"
+    icon="wrench"
+    href="/installation"
+  >
+    Set up the pipeline via Conda, Docker, or Singularity/Apptainer with full system requirements.
+  </Card>
+  <Card
+    title="Configuration"
+    icon="sliders"
+    href="/configuration"
+  >
+    Learn how config.yaml drives every parameter, and how to use dynamic overrides and execution profiles.
+  </Card>
+  <Card
+    title="Pipeline Stages"
+    icon="diagram-project"
+    href="/pipeline/overview"
+  >
+    Deep-dive into each of the six DAG stages, their tools, outputs, and configurable parameters.
+  </Card>
+</CardGroup>
+
+## License and Citation
+
+The BDB-Genomics ATAC-seq Framework is released under the **MIT License**. If you use this pipeline in published research, please cite it as:
+
+> Bhandary, H. (2026). *BDB-Genomics ATAC-seq Framework (Version 3.0.0)*. https://github.com/BDB-Genomics/atacseq-pipeline
+
+A `CITATION.cff` file is included in the repository root for automatic citation export from GitHub.

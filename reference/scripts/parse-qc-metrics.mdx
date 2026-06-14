@@ -1,0 +1,181 @@
+---
+title: "parse_qc_metrics.py: QC Gate Evaluation CLI Reference"
+sidebarTitle: "parse-qc-metrics"
+description: "Complete CLI reference for parse_qc_metrics.py — the script that evaluates FRiP, TSS enrichment, mapping rate, and duplicate rate and writes pass/fail trigger files."
+---
+
+`parse_qc_metrics.py` is the QC gate engine. It is invoked once per sample by the `qc_gate` Snakemake rule after FRiP calculation, TSS enrichment scoring, and `samtools stats` have completed. The script reads the three metric files, evaluates each measurement against its configured threshold, applies WARN/FAIL tiering, and writes three output files: a plain-text log, a structured JSON report, and a single-line trigger file that downstream Snakemake rules consume as a mandatory input dependency.
+
+```bash
+python3 rules/scripts/parse_qc_metrics.py \
+  --sample SAMPLE_NAME \
+  --frip-file results/peak_calling/frip_calculation/SAMPLE_frip.txt \
+  --tss-file results/metrics_qc/tss_enrichment/SAMPLE_tss_enrichment.txt \
+  --stats-file results/post_alignment/samtools_stats/SAMPLE_samtools_stats.txt \
+  --min-frip 0.2 \
+  --min-tss 7.0 \
+  --min-mapping-rate 80.0 \
+  --max-duplicate-rate 20.0 \
+  --log logs/qc_gate/SAMPLE.log \
+  --output results/qc_gate/SAMPLE_qc_pass.txt \
+  --json-output results/qc_gate/SAMPLE_qc_pass.json
+```
+
+---
+
+## Arguments
+
+<ParamField path="--sample" type="string" required>
+  Sample name. Used as the key in all output files and in the human-readable log header (`QC Report for SAMPLE_NAME`). Must match the `sample` column value in the sample sheet.
+</ParamField>
+
+<ParamField path="--frip-file" type="string" required>
+  Path to the FRiP score file produced by the `frip_calculation` rule. The parser handles two formats:
+  - A single-line file containing only the numeric FRiP value.
+  - A two-column tab-separated file (e.g., `SAMPLE\t0.342`) — value is taken from column 2.
+  - A headered TSV (first line contains `"sample"`) — value is taken from column 2 of the second line.
+</ParamField>
+
+<ParamField path="--tss-file" type="string" required>
+  Path to the TSS enrichment score file produced by `tss_enrichment.R`. The parser handles:
+  - A single-line file with just the numeric TSS score.
+  - A two-column tab-separated file (e.g., `SAMPLE\t9.17`).
+  - A headered TSV where the header contains `"sample"` or `"tss"`.
+</ParamField>
+
+<ParamField path="--stats-file" type="string" required>
+  Path to the `samtools stats` output file produced by the `samtools_stats` rule. The parser scans lines starting with `SN` and extracts:
+  - `sequences` → total read count
+  - `properly paired` → properly paired read count
+  - `percentage of properly paired reads` → mapping rate (%)
+  - `reads duplicated` → duplicate read count
+</ParamField>
+
+<ParamField path="--min-frip" type="float" required>
+  Minimum FRiP threshold. Reads from `qc_gate.params.min_frip` in `config.yaml` (default: `0.2`). The sample FAILS if the measured FRiP is strictly less than this value.
+</ParamField>
+
+<ParamField path="--min-tss" type="float" required>
+  Minimum TSS Enrichment threshold. Reads from `qc_gate.params.min_tss_enr` in `config.yaml` (default: `7.0`). The sample FAILS if TSS enrichment is strictly less than this value.
+</ParamField>
+
+<ParamField path="--min-mapping-rate" type="float" required>
+  Minimum mapping rate percentage. Reads from `qc_gate.params.min_mapping_rate` in `config.yaml` (default: `80.0`). The value compared is the `percentage of properly paired reads` field from `samtools stats`, which already represents a percentage (0–100).
+</ParamField>
+
+<ParamField path="--max-duplicate-rate" type="float" required>
+  Maximum duplicate rate percentage. Reads from `qc_gate.params.max_duplicate_rate` in `config.yaml` (default: `20.0`). Duplicate rate is calculated as `(reads_duplicated / sequences) × 100`. The sample FAILS if this derived value is strictly greater than the threshold.
+</ParamField>
+
+<ParamField path="--log" type="string" required>
+  Path to write the plain-text QC log. Parent directories are created automatically. ANSI colour codes are stripped from the log file (they are preserved on stdout for terminal display).
+</ParamField>
+
+<ParamField path="--output" type="string" required>
+  Path to write the Snakemake trigger file. Parent directories are created automatically. Downstream rules declare this file as a required `input:` to enforce the QC gate dependency.
+</ParamField>
+
+<ParamField path="--json-output" type="string" required>
+  Path to write the structured JSON QC report. Suitable for MultiQC custom content modules, pipeline dashboards, or programmatic post-processing.
+</ParamField>
+
+---
+
+## WARN / FAIL Tiering Logic
+
+For each metric the script applies a two-tier evaluation. The WARN boundary is 10 % inside the threshold:
+
+| Metric | Direction | FAIL condition | WARN condition |
+|---|---|---|---|
+| FRiP | `>=` | `val < min_frip` | `min_frip ≤ val < min_frip × 1.1` |
+| TSS Enrichment | `>=` | `val < min_tss` | `min_tss ≤ val < min_tss × 1.1` |
+| Mapping Rate | `>=` | `val < min_mapping_rate` | `min_mapping_rate ≤ val < min_mapping_rate × 1.1` |
+| Duplicate Rate | `<=` | `val > max_duplicate_rate` | `max_duplicate_rate × 0.9 < val ≤ max_duplicate_rate` |
+
+WARN samples receive an overall `"PASSED"` result and proceed through the pipeline. FAIL samples receive an overall `"FAILED"` result. If any input file cannot be parsed, the affected metric defaults to `0.0` (or `100.0` for duplicate rate), the `overall` field is set to `"FAILED"`, and the script continues rather than raising an exception — preventing a parsing error in one sample from blocking all others in the batch.
+
+<Note>
+The script exits with code `0` even when a sample FAILS QC. This is intentional: Snakemake uses the _existence_ of `{sample}_qc_pass.txt` (not the process exit code) as the rule completion signal. Downstream rules inspect the file _contents_ to gate their own execution.
+</Note>
+
+---
+
+## Output Files
+
+### Trigger File (`--output`)
+
+A single line consumed by downstream Snakemake rules:
+
+```
+SAMPLE_NAME\tPASSED
+```
+
+or
+
+```
+SAMPLE_NAME\tFAILED
+```
+
+### JSON Output (`--json-output`)
+
+```json
+{
+    "sample": "ctrl_rep1",
+    "metrics": {
+        "frip": {
+            "val": 0.342,
+            "target": 0.2,
+            "status": "PASS"
+        },
+        "tss": {
+            "val": 9.17,
+            "target": 7.0,
+            "status": "PASS"
+        },
+        "mapping": {
+            "val": 93.4,
+            "target": 80.0,
+            "status": "PASS"
+        },
+        "duplicates": {
+            "val": 12.6,
+            "target": 20.0,
+            "status": "PASS"
+        }
+    },
+    "overall": "PASSED"
+}
+```
+
+Each `status` field is one of `"PASS"`, `"WARN"`, or `"FAIL"`. The `overall` field is `"PASSED"` or `"FAILED"`.
+
+### Text Log (`--log`)
+
+ANSI-stripped plain-text version of the console output:
+
+```
+QC Report for ctrl_rep1
+-------------------------------
+[PASS] FRIP: 0.342
+[WARN] TSS: 7.210 (Borderline)
+[PASS] MAPPING: 93.400
+[PASS] DUPLICATES: 12.600
+-------------------------------
+OVERALL RESULT: PASSED
+```
+
+---
+
+## Metric Parsing Details
+
+<Accordion title="FRiP file parsing (parse_frip)">
+  Opens the FRiP file and reads non-empty lines. If the first line contains the string `"sample"` (case-insensitive), the parser uses the second line. Otherwise it uses the first line. For tab-separated lines, it returns column index 1 (0-based); for single-column lines, it returns the entire line as a float.
+</Accordion>
+
+<Accordion title="TSS enrichment file parsing (parse_tss)">
+  Opens the TSS file and reads non-empty lines. If the first line contains `"sample"` or `"tss"`, the parser uses the second line. For lines with two or more tab-separated columns, it returns column index 1; for single-column lines, it returns the entire value.
+</Accordion>
+
+<Accordion title="Samtools stats parsing (parse_samtools_stats)">
+  Iterates only lines that start with `SN` (the Summary Numbers section). For each `SN` line, it checks for substring matches against four keys — `"sequences"`, `"properly paired"`, `"percentage of properly paired reads"`, `"reads duplicated"` — using a colon-agnostic approach that is robust across samtools versions. Values are parsed using a two-pass `int` → `float` converter that also strips `%` characters and handles scientific notation.
+</Accordion>

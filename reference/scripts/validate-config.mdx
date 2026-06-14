@@ -1,0 +1,167 @@
+---
+title: "validate_config.py: Pre-flight Config Validation CLI Reference"
+sidebarTitle: "validate-config"
+description: "CLI reference for validate_config.py — the pre-flight script that checks config.yaml schema, reference paths, sample sheet integrity, and Conda environments before the DAG builds."
+---
+
+`validate_config.py` is the first thing the pipeline runs. The Snakemake `Snakefile` invokes it automatically via `subprocess.run` at parse time, before Snakemake constructs the DAG, so configuration errors surface immediately with actionable messages rather than cryptic rule failures mid-run. You can also call it manually — for example, in CI before submitting a cluster job — to validate a configuration file without triggering a full pipeline run.
+
+```bash
+python3 rules/scripts/validate_config.py [config_path]
+```
+
+<ParamField path="config_path" type="string" default="config.yaml">
+  Path to the configuration YAML file to validate. Accepts absolute paths or paths relative to the current working directory. If not supplied, defaults to `config.yaml` in the current directory. The script also searches relative to the workflow root (`rules/scripts/../../`) when resolving relative paths.
+</ParamField>
+
+---
+
+## Exit Codes
+
+| Code | Meaning |
+|---|---|
+| `0` | Configuration is valid. Sample sheet parsed successfully. |
+| `1` | One or more validation errors found. Error report printed to stdout and the process exits. |
+
+On success the script prints a single confirmation line:
+
+```
+[CONFIG VALIDATION] OK: /absolute/path/to/data/fastp/samples.tsv
+```
+
+On failure it prints a categorised error report and exits with code `1`.
+
+---
+
+## Error Output Format
+
+Errors are grouped into four categories and printed with ANSI colour formatting (suitable for terminals). When errors reference paths under `data/`, a hint line shows the absolute path that was checked:
+
+```
+┏━ CONFIGURATION VALIDATION FAILED ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━┓
+
+  [Reference Files]
+    • Index prefix not found for config key 'global.references.bowtie2_index': data/reference/index/genome
+      Hint: Check if the file exists at: /home/user/project/data/reference/index/genome
+
+  [Sample Sheet]
+    • FASTQ R1 not found for sample 'ctrl_rep1' at row 2: data/fastq/ctrl_rep1_R1.fastq.gz
+
+  [Schema/Keys]
+    • Missing config key: macs2.params.genome_size
+
+  [Parameters]
+    • Config value 'fastp.params.length_required' must be a positive integer.
+
+┗━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━┛
+
+Check your 'config.yaml' and ensure all required data is in the 'data/' directory.
+```
+
+---
+
+## Validation Categories
+
+### Reference Files
+
+Errors that reference a path and classify as a file-system issue. Triggered when:
+
+- A `global.references.*` path (genome FASTA, chromosome sizes, blacklist, GTF, motif database) does not exist on disk.
+- The Bowtie2 index prefix has no matching `.bt2` or `.bt2l` files in its parent directory.
+- A `script:` or `conda:` path referenced in a `.smk` file cannot be resolved.
+
+### Sample Sheet
+
+Errors relating to the TSV file declared at `global.samples`. Triggered when:
+
+- The sample sheet file cannot be found at any candidate path (relative to the config file directory, workflow root, or CWD).
+- The header row is missing required columns: `sample`, `fastq_r1`, `fastq_r2`, `replicate`, `condition`.
+- A sample ID is empty, contains unsupported characters (only `[A-Za-z0-9._-]` are allowed), or is duplicated.
+- A condition/replicate combination (e.g., `control replicate 1`) appears more than once.
+- FASTQ R1 or R2 paths are missing, identical, or the files cannot be found on disk.
+- A `control` column value references a sample ID that does not appear in the sample sheet.
+- The sample sheet has no data rows after the header.
+
+### Schema / Keys
+
+Missing required configuration keys discovered by scanning all `Snakefile` and `rules/*.smk` files for `config["key"]` access patterns. Any key accessed in a workflow file must be present in `config.yaml`; the first missing ancestor key in a nested path is reported.
+
+### Parameters
+
+Type and value constraint violations:
+
+| Constraint type | Affected config suffixes |
+|---|---|
+| Positive integer | `threads`, `mem_mb`, `trim_front1`, `trim_front2`, `length_required`, `MAPQ`, `flags`, `min_length`, `max_length`, `max_fragment`, `upstream`, `downstream`, `bin_size` |
+| Non-negative float | `min_frip`, `min_tss_enr`, `min_mapping_rate`, `max_duplicate_rate`, `qvalue`, `M` |
+| Non-empty string or positive number | `time`, `mito_chr`, `genome_size`, `feature_types` |
+
+---
+
+## Public Functions
+
+The script is structured as a set of composable validation functions, each accepting the parsed config dict and an `errors` list that is accumulated and reported at the end.
+
+<Accordion title="load_config(config_path, errors)">
+  Reads and parses the YAML file at `config_path`. Appends errors if the file is missing, cannot be parsed as YAML, or its root element is not a mapping. Returns an empty dict on failure so downstream validators can be skipped safely.
+
+  ```python
+  config = load_config(Path("config.yaml"), errors)
+  ```
+</Accordion>
+
+<Accordion title="validate_required_config_paths(config, required_paths, errors)">
+  Iterates over a list of `tuple[str, ...]` key paths (e.g., `("macs2", "params", "genome_size")`) discovered by scanning `.smk` files and verifies each is present in the parsed config. Skips child keys whose parent has already been reported as missing to avoid cascading noise.
+
+  ```python
+  required_paths = collect_required_config_paths(root, errors)
+  validate_required_config_paths(config, required_paths, errors)
+  ```
+</Accordion>
+
+<Accordion title="validate_scalar_config_values(config, errors)">
+  Walks the entire config tree recursively and checks every key whose name matches a known suffix (e.g., any key named `threads` anywhere in the config) against its expected type and value constraint. Reports errors for non-positive integers, negative floats, or empty strings where they are not allowed.
+</Accordion>
+
+<Accordion title="validate_samples_sheet(config, config_path, root, errors)">
+  Resolves the sample sheet path from `global.samples`, opens it as a tab-delimited CSV, validates all required columns are present, and iterates every row to check:
+  - Non-empty, pattern-safe sample IDs
+  - No duplicate sample IDs or condition/replicate pairs
+  - Positive-integer replicate values
+  - FASTQ R1 ≠ R2, both resolvable on disk
+  - Control references resolve to existing sample IDs
+
+  Returns the list of valid sample record dicts for use by `validate_fastp_input_mapping`.
+</Accordion>
+
+<Accordion title="validate_conda_environments(root, errors)">
+  Scans every `rules/*.smk` file for `conda: "path/to/env.yaml"` directives and verifies each referenced file exists on disk, resolving paths relative to the `.smk` file's parent directory (mirroring Snakemake's own resolution behaviour). This catches missing or misnamed Conda environment YAML files before any rule attempts to build a Conda prefix.
+</Accordion>
+
+---
+
+## Example Usage
+
+**Manual pre-flight check before a cluster submission:**
+
+```bash
+python3 rules/scripts/validate_config.py config.yaml && \
+  sbatch run_pipeline.sh
+```
+
+**Validate an alternative config (e.g., a GEO-generated config):**
+
+```bash
+python3 rules/scripts/validate_config.py config_geo.yaml
+```
+
+**In CI (GitHub Actions):**
+
+```yaml
+- name: Validate pipeline config
+  run: python3 rules/scripts/validate_config.py config.yaml
+```
+
+<Warning>
+The script exits with code `1` on any validation failure. In a CI pipeline this will correctly fail the step. The Snakemake `Snakefile` also calls this script with `check=True`, meaning a failed validation will abort DAG construction before any jobs are submitted.
+</Warning>

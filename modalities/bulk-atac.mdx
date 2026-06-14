@@ -1,0 +1,365 @@
+---
+title: "Bulk ATAC-seq Mode: Complete End-to-End Pipeline Guide"
+sidebarTitle: "Bulk ATAC-seq"
+description: "Run the full bulk ATAC-seq pipeline — fastp through TOBIAS footprinting — with automatic IDR pairing, QC gating, and DESeq2 differential accessibility."
+---
+
+The bulk ATAC-seq mode is the default execution track of the BDB-Genomics framework. It drives a complete, production-grade chromatin accessibility analysis from raw FASTQ reads through bias-corrected transcription factor footprints, applying a hard quality-control gate before any compute-intensive downstream work begins. Every stage is configuration-driven: you declare your reference paths, resource limits, and QC thresholds once in `config.yaml`, and the Snakemake DAG handles all orchestration automatically.
+
+## Activating Bulk Mode
+
+Bulk mode is the default. You do not need to set any environment variable or change `config.yaml` to use it. All three forms below are equivalent:
+
+<CodeGroup>
+```bash Default (no flag needed)
+snakemake --use-conda --cores 8
+```
+```bash Environment variable
+ATAC_MODE=bulk snakemake --use-conda --cores 8
+```
+```yaml config.yaml
+global:
+  mode: "bulk"
+```
+</CodeGroup>
+
+If both the environment variable and the config key are set, the environment variable takes precedence.
+
+---
+
+## Modality Comparison
+
+The table below summarises how bulk mode differs from single-cell mode across every major analysis stage.
+
+| Stage | Bulk Mode | Single-Cell Mode (`scatac`) |
+|---|---|---|
+| **Alignment** | Bowtie2 (`--very-sensitive`) | Chromap (`--preset atac`) |
+| **Filtering** | MAPQ > 30, Fixmate, ENCODE Blacklist removal, Tn5 Shift | ArchR Arrow creation & doublet removal |
+| **Peak Calling** | MACS2, IDR replicate concordance | ArchR marker peak identification |
+| **Co-accessibility** | N/A | Cicero (500 bp window, 250 kb distance) |
+| **Differential** | DESeq2 (FDR 0.05, log2FC 1.0) | ArchR cluster markers |
+| **Footprinting** | HINT-ATAC & TOBIAS BINDetect | chromVAR motif accessibility |
+
+---
+
+## Sample Sheet
+
+The bulk pipeline reads sample metadata from a tab-separated file whose path is set in `config.yaml` under `global.samples` (default: `data/fastp/samples.tsv`). Each row represents one biological replicate. The `condition` and `replicate` columns drive automatic IDR pairing.
+
+```tsv
+sample          fastq_r1                         fastq_r2                         condition   replicate
+SRR_ctrl_rep1   data/raw/SRR_ctrl_rep1_R1.fastq.gz   data/raw/SRR_ctrl_rep1_R2.fastq.gz   ctrl        1
+SRR_ctrl_rep2   data/raw/SRR_ctrl_rep2_R1.fastq.gz   data/raw/SRR_ctrl_rep2_R2.fastq.gz   ctrl        2
+SRR_treat_rep1  data/raw/SRR_treat_rep1_R1.fastq.gz  data/raw/SRR_treat_rep1_R2.fastq.gz  treat       1
+SRR_treat_rep2  data/raw/SRR_treat_rep2_R1.fastq.gz  data/raw/SRR_treat_rep2_R2.fastq.gz  treat       2
+```
+
+<Note>
+Every sample requires both `fastq_r1` and `fastq_r2`. The pipeline is paired-end only. Provide absolute paths or paths relative to the repository root.
+</Note>
+
+### How IDR Pairs Are Auto-Computed
+
+The Snakefile reads the `condition` and `replicate` columns and uses `itertools.combinations` to enumerate every possible replicate pair within each condition group. No manual configuration is needed:
+
+```python
+# Snakefile (excerpt — illustrative)
+from itertools import combinations
+from collections import defaultdict
+
+_cond_reps = defaultdict(list)
+for row in rows:
+    _cond_reps[row["condition"]].append(row["replicate"])
+
+IDR_TARGETS = [
+    f"{idr_peaks_path}/{condition}_rep{r1}_rep{r2}_idr_peaks.bed"
+    for cond, reps in _cond_reps.items()
+    for (r1, r2) in combinations(sorted(set(reps)), 2)
+]
+```
+
+For the four-sample sheet above this produces two IDR target files: `ctrl_rep1_rep2_idr_peaks.bed` and `treat_rep1_rep2_idr_peaks.bed`.
+
+---
+
+## Full Pipeline Stages
+
+<Steps>
+
+### Preprocessing — fastp + FastQC
+
+Raw reads are quality-trimmed by fastp with a 5-base front trim on both mates and a minimum length filter of 30 bp, followed by FastQC for per-sample read-level QC metrics.
+
+```yaml
+# config.yaml
+fastp:
+  output: "results/preprocessing/fastp"
+  params:
+    trim_front1: 5
+    trim_front2: 5
+    length_required: 30
+  threads: 4
+  resources:
+    mem_mb: 8000
+    time: 120
+```
+
+### Alignment — Bowtie2
+
+Trimmed paired-end reads are aligned to the reference genome using Bowtie2 in `--very-sensitive` mode.
+
+```yaml
+# config.yaml
+bowtie2:
+  input: "results/preprocessing/fastp"
+  output: "results/alignment/bowtie2"
+  params:
+    index: "data/reference/index/genome"   # set via YAML anchor *BOWTIE2_INDEX
+    sensitive: "--very-sensitive"
+  threads: 8
+  resources:
+    mem_mb: 16000
+    time: 240
+```
+
+### Post-Alignment Filtering
+
+The raw BAM passes through a multi-step filtering chain that removes low-quality alignments and common sources of ATAC-seq noise:
+
+1. **samtools sort** — coordinate-sort the raw BAM
+2. **mitoATAC / remove_mito_reads** — compute and remove mitochondrial reads (`chrMT`)
+3. **samtools fixmate** — fill in mate-score tags required for duplicate marking
+4. **samtools markdup** — mark (but do not remove by default) PCR duplicates
+5. **samtools view** — apply MAPQ ≥ 30 filter and bitflag mask `3844`
+6. **remove_blacklist_reads** — exclude reads overlapping the ENCODE blacklist BED
+7. **tn5_shift** — apply the +4 / −5 bp Tn5 insertion shift to both mates
+
+```yaml
+# config.yaml (samtools_view excerpt)
+samtools_view:
+  params:
+    MAPQ: 30
+    flags: 3844
+```
+
+The final output of this chain is a Tn5-shifted, blacklist-cleaned BAM at `results/post_alignment/tn5_shift/{sample}.filtered.shifted.bam`.
+
+### QC Metrics Collection
+
+Before the quality gate, the pipeline collects a comprehensive set of alignment and library complexity metrics:
+
+- **samtools stats** — mapping rate, insert size distribution
+- **Picard CollectAlignmentSummaryMetrics** — alignment summary
+- **Picard CollectInsertSizeMetrics** — nucleosomal fragment-size histogram
+- **TSS enrichment** — enrichment score around transcription start sites
+- **Preseq** — library complexity curve
+- **QualiMap bamqc** — per-chromosome coverage
+- **Cross-correlation** — NSC/RSC strand cross-correlation
+
+### QC Gate
+
+The pipeline implements a hard QC gate before peak calling. Samples that fail any threshold are recorded in `results/qc_gate/{sample}_qc_pass.txt` and automatically bypassed for downstream footprinting and differential analysis to avoid wasting compute on poor-quality data.
+
+| Metric | Threshold |
+|---|---|
+| FRiP Score | ≥ 0.2 |
+| TSS Enrichment | ≥ 7.0 |
+| Mapping Rate | ≥ 80.0 % |
+| Duplicate Rate | ≤ 20.0 % |
+
+```yaml
+# config.yaml
+qc_gate:
+  params:
+    min_frip: 0.2
+    min_tss_enr: 7.0
+    min_mapping_rate: 80.0
+    max_duplicate_rate: 20.0
+```
+
+<Warning>
+The QC gate runs **before** MACS2 peak calling. Samples that fail will not appear in IDR, consensus peaks, DESeq2, or footprinting outputs. Review `results/qc_gate/` and the MultiQC report to identify failing samples.
+</Warning>
+
+### Peak Calling — MACS2
+
+Samples that pass the QC gate proceed to MACS2 peak calling in BAMPE format (paired-end BAM). The genome effective size (`hs` for human) and q-value threshold are configurable.
+
+```yaml
+# config.yaml
+macs2:
+  params:
+    genome_size: "hs"
+    qvalue: 0.01
+    nomodel: "--nomodel"
+    format: "BAMPE"
+  threads: 8
+  resources:
+    mem_mb: 16000
+    time: 240
+```
+
+Called peaks are immediately filtered against the ENCODE blacklist to produce `results/peak_calling/filtered_peaks/{sample}_filtered_peaks.bed`.
+
+### IDR — Irreproducible Discovery Rate
+
+For each condition, all replicate pairs are run through IDR to identify reproducibly called peaks. IDR pairs are computed automatically from the sample sheet (see above).
+
+```yaml
+# config.yaml
+idr:
+  output:
+    idr_peaks: "results/peak_calling/idr/idr_peaks"
+    optimal_peaks: "results/peak_calling/idr/optimal_peaks"
+    plots: "results/peak_calling/idr/plots"
+  params:
+    idr_threshold: 0.05
+    rank_column: "score"
+```
+
+### Consensus Peaks
+
+High-confidence peaks are merged across all samples into a single consensus peak set. A peak must appear in at least 2 samples (`min_samples: 2`) with a merge distance of 100 bp.
+
+```yaml
+# config.yaml
+consensus_peaks:
+  output:
+    consensus: "results/peak_calling/consensus_peaks"
+    counts: "results/peak_calling/consensus_peaks"
+  params:
+    min_samples: 2
+    merge_distance: 100
+```
+
+The count matrix (`peak_sample_counts.txt`) records per-sample read counts across the consensus peak set and feeds directly into DESeq2.
+
+### Differential Accessibility — DESeq2
+
+DESeq2 uses the consensus peak count matrix to identify differentially accessible regions between conditions. Results, volcano, MA, and PCA plots are written to `results/peak_calling/differential_accessibility/`.
+
+```yaml
+# config.yaml
+differential_accessibility:
+  params:
+    fdr_threshold: 0.05
+    log2fc_threshold: 1.0
+  threads: 8
+  resources:
+    mem_mb: 16000
+    time: 240
+```
+
+### Footprinting — HINT-ATAC + TOBIAS
+
+Two complementary footprinting tools run in parallel to assess transcription factor occupancy:
+
+**TOBIAS (BINDetect)** produces bias-corrected BigWigs and per-motif differential binding scores:
+
+```yaml
+# config.yaml
+tobias:
+  output:
+    corrected_bw: "results/peak_calling/tobias/corrected_bw"
+    bias_track:   "results/peak_calling/tobias/bias_track"
+    footprint_bw: "results/peak_calling/tobias/footprint_bw"
+    bindetect:    "results/peak_calling/tobias/bindetect"
+  params:
+    genome_fa:    "data/reference/genome.fa"
+    motif_db:     "data/motifs/jaspar_vertebrates.meme"
+    conditions:   "condition"
+  threads: 8
+  resources:
+    mem_mb: 16000
+    time: 240
+```
+
+**HINT-ATAC** (via RGT) predicts footprints per sample and writes BED files to `results/peak_calling/footprinting/footprints/{sample}_footprints.bed`.
+
+### chromVAR Motif Deviations
+
+chromVAR quantifies motif accessibility deviation scores across samples using the Tn5-shifted BAMs and the JASPAR motif database.
+
+```yaml
+# config.yaml
+chromvar_analysis:
+  output:
+    deviations:      "results/peak_calling/chromvar/deviations"
+    bias_corrected:  "results/peak_calling/chromvar/bias_corrected"
+    plots:           "results/peak_calling/chromvar/plots"
+  params:
+    motif_db:    "data/motifs/jaspar_vertebrates.meme"
+    genome_fa:   "data/reference/genome.fa"
+    genome_sizes: "data/reference/genome.chrom.sizes"
+  threads: 8
+  resources:
+    mem_mb: 16000
+    time: 240
+```
+
+</Steps>
+
+---
+
+## Output Structure
+
+All outputs are written beneath `results/` and are organised by analysis stage:
+
+```text
+results/
+├── preprocessing/
+│   ├── fastp/          # Trimmed FASTQs and fastp JSON reports
+│   └── fastqc/         # FastQC HTML reports
+├── alignment/
+│   └── bowtie2/        # Raw BAMs from Bowtie2
+├── post_alignment/
+│   ├── samtools_sort/  # Coordinate-sorted BAMs
+│   ├── samtools_markdup/   # Duplicate-marked BAMs
+│   ├── samtools_view/  # MAPQ-filtered, blacklist-cleaned BAMs
+│   └── tn5_shift/      # Tn5-shifted, analysis-ready BAMs
+├── metrics_qc/
+│   ├── tss_enrichment/
+│   ├── picard/
+│   └── cross_correlation/
+├── qc_gate/            # {sample}_qc_pass.txt per sample
+├── peak_calling/
+│   ├── macs2_peakcall/         # Raw narrowPeak files
+│   ├── filtered_peaks/         # Blacklist-filtered BEDs
+│   ├── idr/                    # IDR peaks, optimal sets, plots
+│   ├── consensus_peaks/        # Merged consensus BED + count matrix
+│   ├── differential_accessibility/  # DESeq2 results + plots
+│   ├── tobias/                 # TOBIAS corrected BigWigs + BINDetect
+│   ├── footprinting/           # HINT-ATAC footprint BEDs
+│   └── chromvar/               # chromVAR deviation TSVs + plots
+├── visualization/
+│   ├── bigwig/
+│   ├── normalized_coverage/
+│   ├── heatmap/
+│   └── correlation_analysis/
+└── reporting/
+    ├── multiqc/multiqc_report.html
+    ├── benchmark_summary.tsv
+    └── pipeline_execution_summary.json
+```
+
+<Tip>
+The `benchmarks/` directory at the repository root records wall-clock time, CPU time, and peak memory for every individual job — useful for capacity planning on HPC clusters.
+</Tip>
+
+---
+
+## Graceful Handling of Empty Peak Sets
+
+If a sample passes the QC gate but yields zero peaks after blacklist filtering, downstream rules (ChIPseeker annotations, heatmaps, TOBIAS) detect the empty BED file and produce valid stub outputs — empty DataFrames, blank PDFs — rather than crashing the DAG. The overall pipeline continues processing all other samples.
+
+---
+
+## Aggregated Reporting
+
+On every run, regardless of success or failure, the pipeline writes a machine-readable execution summary:
+
+```
+results/reporting/pipeline_execution_summary.json
+```
+
+This JSON includes per-rule CPU time, peak memory usage, and — on failure — the last five error lines extracted from `logs/`. The MultiQC report at `results/reporting/multiqc/multiqc_report.html` aggregates FastQC, Preseq, Picard, and QC gate metrics into a single browsable HTML file.

@@ -1,0 +1,132 @@
+{
+  "projectType": "infrastructure",
+  "projectName": "BDB-Genomics ATAC-seq Pipeline",
+  "projectDescription": "A production-grade, modular Snakemake pipeline for end-to-end chromatin accessibility analysis supporting both bulk and single-cell ATAC-seq, with upfront configuration validation, strict QC gating, and execution profiles spanning laptops to Kubernetes clusters.",
+  "theme": "aspen",
+  "primaryColor": "#74c4b4",
+  "lightColor": "#049474",
+  "darkColor": "#cbe9e2",
+  "navigation": {
+    "tabs": [
+      {
+        "tab": "Documentation",
+        "groups": [
+          {
+            "group": "Get Started",
+            "pages": [
+              "introduction",
+              "quickstart",
+              "installation"
+            ]
+          },
+          {
+            "group": "Configuration",
+            "pages": [
+              "configuration/config-yaml",
+              "configuration/sample-sheet",
+              "configuration/profiles",
+              "configuration/validation"
+            ]
+          },
+          {
+            "group": "Pipeline Stages",
+            "pages": [
+              "pipeline/overview",
+              "pipeline/preprocessing",
+              "pipeline/alignment",
+              "pipeline/post-alignment",
+              "pipeline/qc-gating",
+              "pipeline/peak-calling",
+              "pipeline/visualization"
+            ]
+          },
+          {
+            "group": "Modalities",
+            "pages": [
+              "modalities/bulk-atac",
+              "modalities/single-cell-atac"
+            ]
+          },
+          {
+            "group": "Deployment",
+            "pages": [
+              "deployment/docker",
+              "deployment/hpc-slurm",
+              "deployment/cloud",
+              "deployment/low-resource"
+            ]
+          },
+          {
+            "group": "Guides",
+            "pages": [
+              "guides/adding-a-tool",
+              "guides/geo-agent",
+              "guides/testing",
+              "guides/contributing"
+            ]
+          }
+        ]
+      },
+      {
+        "tab": "Reference",
+        "groups": [
+          {
+            "group": "Configuration Reference",
+            "pages": [
+              "reference/config-schema",
+              "reference/qc-thresholds",
+              "reference/output-manifest"
+            ]
+          },
+          {
+            "group": "Scripts",
+            "pages": [
+              "reference/scripts/validate-config",
+              "reference/scripts/parse-qc-metrics",
+              "reference/scripts/geo-agent-bridge",
+              "reference/scripts/atacseq-tool",
+              "reference/scripts/run-batched"
+            ]
+          },
+          {
+            "group": "Changelog",
+            "pages": [
+              "reference/changelog"
+            ]
+          }
+        ]
+      }
+    ]
+  },
+  "keyFeatures": [
+    "Dual-modality support for bulk and single-cell ATAC-seq from a single config file",
+    "Upfront configuration validation with categorized error reporting before DAG construction",
+    "Four-metric QC gate (FRiP, TSS enrichment, mapping rate, duplicate rate) with graceful fallbacks",
+    "Eight pre-built execution profiles spanning local workstations to AWS, GCP, Azure, and Kubernetes",
+    "Full Tn5 bias-corrected TF footprinting via TOBIAS BINDetect and HINT-ATAC",
+    "IDR replicate concordance, consensus peak calling, and DESeq2 differential accessibility",
+    "scATAC-seq: Chromap alignment, ArchR Arrow files, doublet detection, UMAP clustering, Cicero co-accessibility",
+    "GEOAgent bridge for automated conversion of GEO metadata to ready-to-run pipeline config",
+    "LangChain tool wrapper exposing the pipeline as an autonomous AI agent tool",
+    "Machine-readable pipeline execution summary JSON with per-rule CPU and memory benchmarks",
+    "Docker container with micromamba runner; individual rule environments via Conda/Singularity",
+    "Sequential batching script for ultra-low-memory execution on ≤4 GB RAM machines"
+  ],
+  "publicApiSurface": [
+    "snakemake --use-conda --cores 8 (bulk mode)",
+    "ATAC_MODE=scatac snakemake --use-conda --cores 8 (scATAC mode)",
+    "snakemake --profile profile/<name> (profile-based execution)",
+    "snakemake --configfile config.yaml custom_override.yaml (dynamic config merging)",
+    "python3 rules/scripts/validate_config.py config.yaml",
+    "python3 rules/scripts/parse_qc_metrics.py --sample <name> --frip-file ... --tss-file ... --stats-file ... --min-frip ... --min-tss ... --min-mapping-rate ... --max-duplicate-rate ... --log ... --output ... --json-output ...",
+    "python3 rules/scripts/geo_agent_bridge.py path/to/ATAC_meta.csv [--download]",
+    "python3 rules/scripts/run_batched.py --batch-size <n> --cores <n> --profile <path>",
+    "python3 rules/scripts/generate_test_data.py",
+    "bash rules/scripts/download_real_data.sh",
+    "python3 rules/scripts/aggregate_logs.py <success|error> <output_json>",
+    "python3 rules/scripts/zenodo_deposit.py [--production]",
+    "run_atacseq_pipeline(profile, cores, use_conda, batch_size, config_override_path, geo_metadata_csv, download_geo, project_dir) [LangChain @tool]",
+    "docker build -t bdb-atacseq . && docker run -it --rm -v $(pwd):/app bdb-atacseq --use-conda --cores 8",
+    "config.yaml keys: global, fastp, fastqc, bowtie2, samtools_*, tn5_shift, picard, tss_enrichment, fragment_size_analysis, qc_gate, macs2, blacklist_filter, frip_calculation, idr, consensus_peaks, differential_accessibility, tobias, footprinting, chromvar_analysis, bigwig, heatmap, multiqc, chromap, archr, cicero"
+  ]
+}

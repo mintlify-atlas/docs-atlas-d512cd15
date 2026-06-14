@@ -1,0 +1,283 @@
+---
+title: "Post-Alignment Filtering: From Sorted BAM to Tn5 Shift"
+sidebarTitle: "Post-Alignment"
+description: "Eight-step filtering chain — fixmate, markdup, mito removal, MAPQ filter, blacklist exclusion, and Tn5 insertion-site correction."
+---
+
+The sorted BAM that leaves the alignment stage is not yet suitable for peak calling. It contains reads from the mitochondrial genome (which are massively over-represented in ATAC-seq), PCR duplicates that inflate apparent fragment depth, reads that aligned poorly or to artifactual loci in the ENCODE blacklist, and — critically — reads whose 5′ ends have not been shifted to reflect the true Tn5 insertion site. The post-alignment stage corrects all of these problems in a strict eight-step chain. Each step is an independent Snakemake rule so that jobs can be parallelized across samples and individual failures are isolated rather than crashing the entire pipeline.
+
+## Filtering Chain at a Glance
+
+```
+{sample}.sorted.bam                      ← from samtools_sort
+    │
+    ├─ calculate_mito_reads ─────────────► mito_stats.txt
+    │
+    ▼
+samtools_fixmate                          ← mate-pair information for markdup
+    │
+    ▼
+samtools_markdup                          ← duplicate flagging (mark, not remove)
+    │
+    ├─ samtools_stats ────────────────────► {sample}_postFiltering.stats.txt
+    │
+    ▼
+remove_mito_reads                         ← exclude chrMT
+    │
+    ▼
+samtools_view (MAPQ ≥ 30, -F 3844 -f 2)  ← alignment quality gate
+    │
+    ▼
+remove_blacklist_reads (bedtools)         ← ENCODE blacklist exclusion
+    │
+    ▼
+tn5_shift (alignmentSieve --ATACshift)   ← +4 bp / −5 bp correction
+    │
+    ▼
+{sample}.filtered.shifted.bam            ► peak calling, visualization, QC
+```
+
+## Step 1 — Calculate Mitochondrial Reads
+
+Before removing mitochondrial reads, the pipeline quantifies how many exist. This produces a `mito_stats.txt` file consumed by the QC reporting layer.
+
+```yaml
+# config.yaml
+mitoATAC_calculate:
+  input:
+    sorted_bam: "results/post_alignment/samtools_sort"
+  output:
+    mito_stats: "results/post_alignment/mito-ATAC"
+  params:
+    mito_chr: "chrMT"
+  threads: 2
+  resources:
+    mem_mb: 4000
+    time: 30
+```
+
+<Note>
+  The mitochondrial chromosome is referenced as `chrMT` in this pipeline's reference genome. If your genome uses `chrM` instead, update `mitoATAC_calculate.params.mito_chr` and `remove_mito_reads.params.mito_chr` in `config.yaml`.
+</Note>
+
+**Why this matters:** ATAC-seq libraries routinely contain 30–80% mitochondrial reads because mitochondria lack nucleosomes and are therefore extremely accessible to Tn5. Including these reads in downstream analysis skews library complexity estimates and wastes alignment compute on reads that will never contribute a valid peak.
+
+## Step 2 — samtools fixmate
+
+`samtools fixmate` populates mate-pair information (insert size, mate coordinate, mate strand) in the BAM flags field. This information is required for `samtools markdup` to correctly identify optical and PCR duplicates in paired-end data.
+
+```yaml
+# config.yaml
+samtools_fixmate:
+  input:
+    sorted_bam_noMT: "results/post_alignment/samtools_sort"
+  output:
+    sorted_bam_noMT_fixmate: "results/post_alignment/samtools_fixmate"
+  threads: 2
+  resources:
+    mem_mb: 2000
+    time: 30
+```
+
+## Step 3 — samtools markdup
+
+Duplicate reads arise from PCR amplification of the same original DNA fragment. Rather than removing them outright (which would destroy information needed for library complexity estimates), the pipeline **marks** them with the SAM duplicate flag (`0x400`) by default. Downstream rules and the QC gate can then compute duplication rates from the marked BAM without losing data.
+
+```yaml
+# config.yaml
+samtools_markdup:
+  input:
+    sorted_bam_noMT_fixmate: "results/post_alignment/samtools_fixmate"
+  output:
+    markdup_bam: "results/post_alignment/samtools_markdup"
+  params:
+    remove_duplicates: false   # mark only; set true to hard-remove
+  threads: 4
+  resources:
+    mem_mb: 8000
+    time: 120
+```
+
+The rule translates `remove_duplicates` to the `-r` flag dynamically:
+
+```python
+params:
+    dup_flag = "-r" if config['samtools_markdup']['params']['remove_duplicates'] else ""
+```
+
+```bash
+samtools markdup \
+    {params.dup_flag} \
+    -d 2500 \          # optical duplicate distance in pixels
+    -@ {threads} \
+    {input.sorted_bam_noMT_fixmate} \
+    {output.deduplicated_bam}
+```
+
+<Tip>
+  The optical duplicate distance `-d 2500` is appropriate for patterned Illumina flow cells (HiSeq 4000, NovaSeq). For unpatterned flow cells (HiSeq 2500), lower this to `-d 100` via a config override.
+</Tip>
+
+## Step 4 — Remove Mitochondrial Reads
+
+After duplication marking, the mitochondrial chromosome reads are excluded. The exclusion is performed by chromosome name (`chrMT`) using `samtools view`:
+
+```yaml
+# config.yaml
+remove_mito_reads:
+  input:
+    sorted_bam: "results/post_alignment/samtools_markdup"
+  output:
+    noMT_sorted_bam: "results/post_alignment/remove_mito_reads"
+  params:
+    mito_chr: "chrMT"
+  threads: 2
+  resources:
+    mem_mb: 2000
+    time: 30
+```
+
+Output: `results/post_alignment/remove_mito_reads/{sample}_noMT.sorted.bam`
+
+## Step 5 — samtools view (MAPQ Filter)
+
+Multi-mapping reads and reads with alignment ambiguity are removed by requiring a minimum mapping quality of MAPQ ≥ 30. In addition, bitwise flag filtering excludes unmapped reads, secondary alignments, supplementary alignments, reads failing platform QC, and unproperly paired reads:
+
+```yaml
+# config.yaml
+samtools_view:
+  input:
+    noMT_sorted_bam: "results/post_alignment/remove_mito_reads"
+  output:
+    filtered_bam: "results/post_alignment/samtools_view"
+  params:
+    MAPQ: 30
+    flags: 3844
+  threads: 2
+  resources:
+    mem_mb: 2000
+    time: 30
+```
+
+```bash
+samtools view \
+    -@ {threads} \
+    -b \
+    -q 30 \          # MAPQ ≥ 30
+    -F 3844 \        # exclude: unmapped, secondary, QC-fail, duplicate, supplementary
+    -f 2 \           # require: properly paired
+    {input.dedup_bam} \
+    -o {output.filtered_bam}
+```
+
+**Flag 3844 breakdown:**
+
+| Bit | Flag | Meaning |
+|---|---|---|
+| 0x4 | 4 | Read unmapped |
+| 0x100 | 256 | Secondary alignment |
+| 0x200 | 512 | Not passing platform/vendor QC checks |
+| 0x400 | 1024 | PCR or optical duplicate |
+| 0x800 | 2048 | Supplementary alignment |
+
+Output: `results/post_alignment/samtools_view/{sample}.filtered.pre_blacklist.bam`
+
+## Step 6 — Remove Blacklist Reads
+
+The ENCODE blacklist contains genomic regions (centromeres, telomeres, low-complexity repeats) that consistently produce anomalously high read counts regardless of the biological experiment. These regions produce artifactual peaks that overwhelm downstream analysis. The pipeline uses `bedtools intersect -v` to exclude any read whose alignment overlaps a blacklist interval:
+
+```yaml
+# config.yaml
+remove_blacklist_reads:
+  input:
+    filtered_bam: "results/post_alignment/samtools_view"
+    blacklist: "data/reference/ENCODE_blacklist.bed"   # *BLACKLIST anchor
+  output:
+    filtered_bam_clean: "results/post_alignment/samtools_view"
+  threads: 2
+  resources:
+    mem_mb: 4000
+    time: 30
+```
+
+```bash
+# rules/remove_blacklist_reads.smk
+bedtools intersect -v -abam {input.bam} -b {input.blacklist} > {output.bam}
+```
+
+The `-v` flag inverts the intersection, retaining only reads that do **not** overlap any blacklist region. Output: `results/post_alignment/samtools_view/{sample}.filtered.bam`.
+
+## Step 7 — Tn5 Insertion-Site Correction
+
+The most ATAC-seq-specific step of the entire pipeline. Tn5 transposase cleaves a double-strand break and inserts its payload adapter at the cut site, but the physical insertion spans 9 bp. After alignment, the 5′ end of each read is offset from the true cut site by +4 bp on the forward strand and −5 bp on the reverse strand. All ATAC-seq signal analysis assumes reads start exactly at the cut site; without this correction, footprints and TSS enrichment profiles are blurred by up to 9 bp.
+
+```yaml
+# config.yaml
+tn5_shift:
+  input:
+    filtered_bam: "results/post_alignment/samtools_view"
+  output:
+    shifted_bam:       "results/post_alignment/tn5_shift"
+    shifted_bam_index: "results/post_alignment/tn5_shift"
+  threads: 4
+  resources:
+    mem_mb: 4000
+    time: 60
+```
+
+The shift is performed by `alignmentSieve --ATACshift` from the deepTools suite:
+
+```bash
+# rules/tn5_shift.smk
+alignmentSieve --ATACshift \
+    -b {input.filtered_bam} \
+    -o {output.shifted_filtered_bam}.unsorted \
+    -p {threads} \
+    2> {log}
+
+samtools sort -@ {threads} \
+    -o {output.shifted_filtered_bam} \
+    {output.shifted_filtered_bam}.unsorted
+
+rm -f {output.shifted_filtered_bam}.unsorted
+
+samtools index {output.shifted_filtered_bam} {output.shifted_filtered_bam_index}
+```
+
+<Warning>
+  The `alignmentSieve --ATACshift` tool requires the BAM to be indexed before it can shift reads. The pipeline ensures indexing occurs in the correct order through Snakemake's dependency graph — the `samtools_index_post_filter` rule runs before `tn5_shift` and is declared as an explicit input.
+</Warning>
+
+Output: `results/post_alignment/tn5_shift/{sample}.filtered.shifted.bam`
+
+## Step 8 — samtools stats (Post-Filter QC)
+
+After the full filtering chain completes, `samtools stats` is run on the mito-removed BAM to collect alignment statistics (total reads, properly paired count, duplicate count) that are later consumed by `parse_qc_metrics.py` at the QC gate:
+
+```yaml
+# config.yaml
+samtools_stats:
+  input:
+    filtered_bam: "results/post_alignment/remove_mito_reads"
+  output:
+    stats: "results/post_alignment/samtools_stats"
+  threads: 2
+  resources:
+    mem_mb: 2000
+    time: 30
+```
+
+Output: `results/post_alignment/samtools_stats/{sample}_postFiltering.stats.txt`
+
+## Complete Output Summary
+
+| Rule | Output File | Next Consumed By |
+|---|---|---|
+| `calculate_mito_reads` | `mito_stats.txt` | QC reporting |
+| `samtools_fixmate` | `{sample}.sorted.fixmate.bam` | `samtools_markdup` |
+| `samtools_markdup` | `{sample}.sorted.dedup.bam` | Picard metrics, `remove_mito_reads` |
+| `remove_mito_reads` | `{sample}_noMT.sorted.bam` | `samtools_view`, `samtools_stats` |
+| `samtools_view` | `{sample}.filtered.pre_blacklist.bam` | `remove_blacklist_reads` |
+| `remove_blacklist_reads` | `{sample}.filtered.bam` | `tn5_shift`, TOBIAS, HINT-ATAC |
+| `tn5_shift` | `{sample}.filtered.shifted.bam` | MACS2, BigWig, TSS enrichment |
+| `samtools_stats` | `{sample}_postFiltering.stats.txt` | QC gate (`parse_qc_metrics.py`) |

@@ -1,0 +1,177 @@
+---
+title: "BDB ATAC-seq Pipeline: QC Gate Thresholds Reference"
+sidebarTitle: "QC Thresholds"
+description: "Complete reference for the four gated QC metrics, the WARN advisory tier, and all additional metrics collected per sample throughout the pipeline."
+---
+
+The BDB-Genomics ATAC-seq pipeline enforces a mandatory biological quality checkpoint — the **QC Gate** — that sits between metrics collection and all expensive downstream steps (peak calling, visualisation, differential accessibility, footprinting). Before any Tn5-shifted BAM advances to MACS2, the `parse_qc_metrics.py` script evaluates four quantitative thresholds against per-sample measurements derived from FRiP calculation, TSS enrichment scoring, and `samtools stats`. Samples that fail any threshold produce a `{sample}_qc_pass.txt` file containing `FAILED`, which downstream Snakemake rules use as an explicit dependency — preventing wasted compute on biologically poor data while keeping the pipeline DAG intact for all other samples.
+
+---
+
+## Gated Metrics
+
+The four parameters below map directly to `qc_gate.params` in `config.yaml` and are passed as CLI arguments to `parse_qc_metrics.py`.
+
+<ParamField path="min_frip" type="float" default="0.2">
+  **FRiP Score** — Fraction of Reads in Peaks.
+
+  The proportion of uniquely mapped reads that fall within MACS2-called peaks after blacklist filtering. Calculated as `reads_in_peaks / total_mapped_reads`. The ENCODE consortium sets a minimum recommendation of **0.2** for bulk ATAC-seq; values below this indicate poor signal-to-noise or failed chromatin accessibility enrichment. High-quality experiments typically achieve FRiP ≥ 0.3.
+</ParamField>
+
+<ParamField path="min_tss_enr" type="float" default="7.0">
+  **TSS Enrichment** — Signal at Transcription Start Sites relative to background.
+
+  Computed as the ratio of normalised read density in a ±2 kb window centred on annotated TSSes versus the flanking background signal. This metric is the primary indicator of chromatin accessibility library quality. ENCODE recommendations suggest a minimum of **5.0** for acceptable experiments; the pipeline default of **7.0** reflects a stricter threshold for high-confidence analysis.
+</ParamField>
+
+<ParamField path="min_mapping_rate" type="float" default="80.0">
+  **Mapping Rate %** — Percentage of properly paired reads.
+
+  Sourced from the `percentage of properly paired reads` field in the `samtools stats` summary section (lines starting with `SN`). Reads reported as properly paired by `samtools stats` must meet both mate-pair criteria and the MAPQ ≥ 30 filter applied upstream. Values below **80 %** suggest alignment artefacts, genome mismatch, or severe contamination.
+</ParamField>
+
+<ParamField path="max_duplicate_rate" type="float" default="20.0">
+  **Duplicate Rate %** — Fraction of reads flagged as PCR or optical duplicates.
+
+  Calculated as `(reads_duplicated / sequences) × 100` from the `reads duplicated` and `sequences` fields in `samtools stats`. The pipeline uses `samtools markdup` (with `remove_duplicates: false`) to mark duplicates while retaining them; the duplicate rate is measured from the post-deduplication stats file. Rates above **20 %** indicate over-amplification or insufficient starting material.
+</ParamField>
+
+---
+
+## WARN Advisory Tier
+
+The QC gate implements a two-level tiering system. In addition to a binary PASS/FAIL decision, the script flags samples in the **WARN** tier when a metric is within 10 % of the threshold boundary:
+
+| Metric | Operator | FAIL | WARN (borderline) |
+|---|---|---|---|
+| FRiP | `>=` | `< min_frip` | `< min_frip × 1.1` but `>= min_frip` |
+| TSS Enrichment | `>=` | `< min_tss_enr` | `< min_tss_enr × 1.1` but `>= min_tss_enr` |
+| Mapping Rate | `>=` | `< min_mapping_rate` | `< min_mapping_rate × 1.1` but `>= min_mapping_rate` |
+| Duplicate Rate | `<=` | `> max_duplicate_rate` | `> max_duplicate_rate × 0.9` but `<= max_duplicate_rate` |
+
+<Note>
+WARN-tier samples still receive a **PASSED** overall result and proceed through the full pipeline. The WARN status is advisory only — it appears in the per-sample text log and JSON output to help identify borderline experiments before committing to expensive downstream analyses.
+</Note>
+
+---
+
+## Additional Metrics Collected (Not Gated)
+
+The following metrics are captured by the pipeline and included in the MultiQC report but do not block downstream processing.
+
+### Fragment Size Distribution
+
+Derived from **Picard `CollectInsertSizeMetrics`** run on the deduplicated BAM (`results/metrics_qc/picard/CollectInsertSizeMetrics/`). The resulting histogram reflects the nucleosomal banding pattern characteristic of ATAC-seq:
+
+| Band | Fragment Range | Interpretation |
+|---|---|---|
+| Sub-nucleosomal | < 200 bp | Nucleosome-free regions (NFR); highest signal expected |
+| Mono-nucleosomal | 200 – 400 bp | Reads wrapping a single nucleosome |
+| Di-nucleosomal | > 400 bp | Reads spanning two nucleosomes |
+
+A healthy ATAC-seq library shows a pronounced NFR peak with decreasing amplitude at each nucleosomal harmonic. Absent or inverted banding patterns indicate degraded chromatin or incomplete Tn5 tagmentation.
+
+Further analysis is performed by `fragment_size_analysis` using the following parameters from `config.yaml`:
+
+- `min_length`: 30 bp (fragments shorter than this are excluded)
+- `max_length`: 1000 bp (fragments longer than this are excluded)
+- `max_fragment`: 1000 bp (upper x-axis limit for histogram plots)
+
+### NSC / RSC Cross-Correlation
+
+Computed by **phantompeakqualtools** from the filtered BAM (`results/metrics_qc/cross_correlation/`).
+
+| Metric | Description | ENCODE Threshold |
+|---|---|---|
+| NSC | Normalized Strand Cross-correlation coefficient | > 1.05 recommended |
+| RSC | Relative Strand Cross-correlation coefficient | > 0.8 recommended |
+
+Cross-correlation is run with `max_range: 150` bp and `num_threads: 4` (from `config.yaml`). Low NSC/RSC values indicate poor signal enrichment and may correlate with FRiP failure.
+
+### Preseq Library Complexity
+
+**Preseq** (`results/reporting_qc/preseq/`) estimates the yield of distinct read pairs at higher sequencing depths by fitting a statistical model to the observed distinct-read accumulation curve. This metric is informational — it guides decisions about additional sequencing rather than filtering existing data. A flattening curve indicates library saturation.
+
+### Qualimap BAM QC
+
+**Qualimap bamqc** (`results/reporting_qc/qualimap/`) provides supplementary BAM-level QC including:
+- Coverage uniformity across chromosomes
+- GC content distribution
+- Read mapping quality histogram
+- Duplication rate (independent estimate)
+
+All Qualimap outputs are ingested by MultiQC for consolidated reporting.
+
+---
+
+## Output Files
+
+Each sample generates three output files in `results/qc_gate/`:
+
+### `{sample}_qc_pass.txt` — Snakemake trigger file
+
+A single tab-separated line consumed by downstream Snakemake rules as a mandatory input dependency:
+
+```
+SAMPLE_NAME\tPASSED
+```
+
+or
+
+```
+SAMPLE_NAME\tFAILED
+```
+
+### `{sample}_qc_pass.json` — Structured QC data
+
+A machine-readable JSON file suitable for MultiQC custom content modules, dashboards, or downstream analysis scripts:
+
+```json
+{
+    "sample": "SAMPLE_NAME",
+    "metrics": {
+        "frip": {
+            "val": 0.342,
+            "target": 0.2,
+            "status": "PASS"
+        },
+        "tss": {
+            "val": 9.17,
+            "target": 7.0,
+            "status": "PASS"
+        },
+        "mapping": {
+            "val": 93.4,
+            "target": 80.0,
+            "status": "PASS"
+        },
+        "duplicates": {
+            "val": 12.6,
+            "target": 20.0,
+            "status": "PASS"
+        }
+    },
+    "overall": "PASSED"
+}
+```
+
+The `status` field for each metric is one of `"PASS"`, `"WARN"`, or `"FAIL"`. The `overall` field is `"PASSED"` if all metrics individually pass (regardless of WARN flags), or `"FAILED"` if any metric reaches FAIL status or if any input file could not be parsed.
+
+### `{sample}_qc_gate.log` — Human-readable text log
+
+An ANSI-stripped plain-text report written to `logs/qc_gate/{sample}.log` (the `--log` path in `parse_qc_metrics.py`). Example output:
+
+```
+QC Report for SAMPLE_NAME
+-------------------------------
+[PASS] FRIP: 0.342
+[PASS] TSS: 9.170
+[PASS] MAPPING: 93.400
+[PASS] DUPLICATES: 12.600
+-------------------------------
+OVERALL RESULT: PASSED
+```
+
+<Tip>
+To adjust thresholds for a different organism or data quality standard, edit the four parameters under `qc_gate.params` in `config.yaml`. Thresholds apply globally to all samples in the run.
+</Tip>

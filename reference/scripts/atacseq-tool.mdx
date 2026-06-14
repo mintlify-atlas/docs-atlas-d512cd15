@@ -1,0 +1,165 @@
+---
+title: "atacseq_tool.py: LangChain Pipeline Tool Wrapper Reference"
+sidebarTitle: "atacseq-tool"
+description: "Reference for the run_atacseq_pipeline LangChain tool that exposes the BDB ATAC-seq pipeline to AI agents, with all parameters, execution steps, and registration instructions."
+---
+
+`atacseq_tool.py` exposes the complete BDB-Genomics ATAC-seq pipeline as a callable LangChain tool, making the end-to-end genomic analysis workflow accessible to AI agents and automated orchestration systems. The `run_atacseq_pipeline` function is decorated with `@tool("run_atacseq_pipeline")`, which registers it in LangChain's tool registry so agents can invoke it by name, passing structured arguments. The function handles pre-flight validation, optional GEOAgent data import, Snakemake execution (standard or batched), and returns a detailed status string that includes the structured execution summary if one is available.
+
+```python
+from rules.scripts.atacseq_tool import run_atacseq_pipeline
+
+result = run_atacseq_pipeline(
+    profile="local",
+    cores=8,
+    use_conda=True
+)
+print(result)
+```
+
+---
+
+## LangChain Import and Graceful Fallback
+
+The tool uses a graceful fallback so it can be imported and called in environments where LangChain is not installed:
+
+```python
+try:
+    from langchain.tools import tool
+except ImportError:
+    # Fallback mock decorator — function works as a plain Python callable
+    def tool(func):
+        return func
+```
+
+When LangChain is not installed, `run_atacseq_pipeline` behaves as a standard Python function and can be called directly without any agent framework.
+
+---
+
+## Function Signature
+
+```python
+@tool("run_atacseq_pipeline")
+def run_atacseq_pipeline(
+    profile: str = "local",
+    cores: int = 8,
+    use_conda: bool = True,
+    batch_size: Optional[int] = None,
+    config_override_path: Optional[str] = None,
+    geo_metadata_csv: Optional[str] = None,
+    download_geo: bool = False,
+    project_dir: str = "."
+) -> str:
+```
+
+---
+
+## Parameters
+
+<ParamField path="profile" type="string" default="local">
+  Execution environment profile. Corresponds to a subdirectory under `profile/` in the pipeline root (e.g., `profile/local/`, `profile/slurm/`). The profile directory must contain a `config.yaml` defining Snakemake cluster settings.
+
+  Supported values: `"local"`, `"slurm"`, `"low_resource"`, `"aws"`, `"gcp"`, `"azure"`, `"kubernetes"`.
+</ParamField>
+
+<ParamField path="cores" type="integer" default="8">
+  Number of CPU cores to pass to `snakemake --cores`. Applies to local and HPC runs. For cluster profiles (SLURM, cloud), this controls the maximum concurrent local threads; per-rule resources are governed by the profile's `config.yaml`.
+</ParamField>
+
+<ParamField path="use_conda" type="boolean" default="true">
+  When `true`, passes `--use-conda --conda-frontend conda` to Snakemake so each rule resolves its dependencies via the Conda environment declared in its `conda:` directive. Requires Conda or Mamba to be available on the `PATH`.
+</ParamField>
+
+<ParamField path="batch_size" type="integer" default="null">
+  When set to a positive integer, the tool invokes `run_batched.py` instead of directly calling `snakemake`, splitting the sample list into sequential batches of this size. Useful for machines with limited RAM where running all samples concurrently would cause out-of-memory failures. When `null`, all samples are processed in a single Snakemake invocation.
+</ParamField>
+
+<ParamField path="config_override_path" type="string" default="null">
+  Optional path to a secondary YAML config file. When provided, it is appended to the Snakemake `--configfile` argument list, allowing partial overrides of `config.yaml` without modifying the base file. Only applied when `batch_size` is `null` (standard Snakemake mode).
+</ParamField>
+
+<ParamField path="geo_metadata_csv" type="string" default="null">
+  Optional path to a GEOAgent or bioStream metadata CSV. When provided, the tool first invokes `geo_agent_bridge.py` to generate `config_geo.yaml` and a sample sheet, then uses `config_geo.yaml` as the pipeline config for the subsequent Snakemake run. See the [geo-agent-bridge reference](/reference/scripts/geo-agent-bridge) for CSV format details.
+</ParamField>
+
+<ParamField path="download_geo" type="boolean" default="false">
+  When `true` and `geo_metadata_csv` is set, passes `--download` to `geo_agent_bridge.py` to automatically fetch SRA FASTQ files before running the pipeline. Requires the SRA toolkit (`prefetch`, `fasterq-dump`) on the system `PATH`.
+</ParamField>
+
+<ParamField path="project_dir" type="string" default=".">
+  Root directory of the ATAC-seq pipeline repository. All internal script paths, the config file, and the Snakemake working directory are resolved relative to this path. Defaults to the current working directory.
+</ParamField>
+
+---
+
+## Execution Steps
+
+The function performs the following steps in order:
+
+<Steps>
+  <Step title="GEOAgent Bridge (optional)">
+    If `geo_metadata_csv` is provided, runs `python3 rules/scripts/geo_agent_bridge.py <csv_path> [--download]` as a subprocess. On failure (non-zero exit code), returns an error string immediately without proceeding. On success, switches the active config path to the generated `config_geo.yaml`.
+  </Step>
+
+  <Step title="Pre-flight Configuration Validation">
+    Runs `python3 rules/scripts/validate_config.py <config_path>` as a subprocess. On failure, returns a formatted error string containing both stderr and stdout from the validation script. This step mirrors what the `Snakefile` itself does at parse time, but the tool surfaces it explicitly so agents receive actionable feedback without having to parse Snakemake DAG error logs.
+  </Step>
+
+  <Step title="Build Execution Command">
+    Constructs the Snakemake (or `run_batched.py`) command:
+    - **Standard mode** (`batch_size = None`): `snakemake --profile profile/{profile} --cores {cores} [--use-conda --conda-frontend conda] [--configfile ...]`
+    - **Batched mode** (`batch_size` set): `python3 rules/scripts/run_batched.py --batch-size {batch_size} --cores {cores} --profile profile/{profile} [--conda-frontend conda]`
+  </Step>
+
+  <Step title="Execute Pipeline">
+    Runs the constructed command via `subprocess.run` with the project directory as the working directory. Captures both stdout and stderr. Any exception raised during subprocess launch (e.g., `snakemake` not found on `PATH`) is caught and returned as an error string.
+  </Step>
+
+  <Step title="Load Structured Summary">
+    Checks for `results/reporting/pipeline_execution_summary.json`. If the file exists, its contents are JSON-parsed and appended to the return string as a formatted `Structured Summary:` block.
+  </Step>
+
+  <Step title="Return Status String">
+    Returns a multi-line string to the agent:
+    - **On success:** `"Pipeline completed successfully!\nOutput metrics:\n{stdout}\n\nStructured Summary:\n{json}"`
+    - **On failure:** `"Pipeline execution failed with exit code {N}.\nError details:\n{stderr}\n{stdout}"`
+  </Step>
+</Steps>
+
+---
+
+## Return Value
+
+The function always returns a `str`. The agent framework should treat a string beginning with `"Pipeline completed successfully!"` as a success indicator. All other strings (beginning with `"Error:"`, `"Configuration Validation Failed:"`, `"GEOAgent Bridge Import Failed:"`, or `"Pipeline execution failed"`) indicate failure conditions.
+
+---
+
+## Registering in a LangChain Agent
+
+```python
+from langchain.agents import initialize_agent, AgentType
+from langchain_openai import ChatOpenAI
+from rules.scripts.atacseq_tool import run_atacseq_pipeline
+
+llm = ChatOpenAI(model="gpt-4o", temperature=0)
+
+agent = initialize_agent(
+    tools=[run_atacseq_pipeline],
+    llm=llm,
+    agent=AgentType.OPENAI_FUNCTIONS,
+    verbose=True
+)
+
+result = agent.run(
+    "Run the ATAC-seq pipeline on the GEO dataset in geo_meta.csv "
+    "with 16 cores, using the SLURM profile."
+)
+```
+
+<Tip>
+Because `run_atacseq_pipeline` is decorated with `@tool("run_atacseq_pipeline")`, LangChain automatically extracts its docstring as the tool description and its type-annotated parameters as the tool schema. The agent uses this schema to populate arguments from natural language instructions.
+</Tip>
+
+<Warning>
+The tool runs Snakemake as a blocking subprocess — it will not return until the pipeline finishes or fails. For long-running pipelines on HPC clusters, consider wrapping the tool in an async agent or using a Snakemake cluster profile that submits jobs and returns immediately.
+</Warning>

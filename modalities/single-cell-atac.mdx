@@ -1,0 +1,309 @@
+---
+title: "Single-Cell ATAC-seq Mode: Chromap, ArchR, and Cicero"
+sidebarTitle: "scATAC-seq"
+description: "Run scATAC-seq with Chromap alignment, ArchR doublet removal and UMAP clustering, Cicero co-accessibility, and chromVAR motif deviations."
+---
+
+The single-cell ATAC-seq (`scatac`) mode replaces the bulk alignment and peak-calling stack with a purpose-built single-cell analysis chain. Chromap aligns reads at high speed against the reference index, ArchR constructs Arrow files, removes doublets, performs iterative LSI dimensionality reduction, and clusters cells via UMAP. Cicero then maps chromatin co-accessibility networks across a configurable genomic window. All QC decisions in this mode are delegated to ArchR's internal thresholds — the pipeline-level QC gate that runs between alignment and peak calling in bulk mode is skipped entirely.
+
+## Activating scATAC Mode
+
+Switch to single-cell mode with the `ATAC_MODE` environment variable or the `global.mode` key in `config.yaml`:
+
+<CodeGroup>
+```bash Environment variable (recommended)
+ATAC_MODE=scatac snakemake --use-conda --cores 8
+```
+```yaml config.yaml
+global:
+  mode: "scatac"
+```
+</CodeGroup>
+
+<Note>
+The environment variable takes priority over `config.yaml`. If you set `ATAC_MODE=scatac` on the command line, it overrides any value written in `global.mode`.
+</Note>
+
+---
+
+## Sample Sheet Format
+
+The scATAC pipeline reads from the same tab-separated sample sheet as bulk mode (path set by `global.samples`, default `data/fastp/samples.tsv`). Each row represents one library (or one barcode manifest file, depending on your experimental design). The `condition` and `replicate` columns are still parsed but are used by ArchR for pseudo-bulk grouping rather than for IDR analysis.
+
+```tsv
+sample          fastq_r1                              fastq_r2                              condition   replicate
+SC_lib1         data/raw/SC_lib1_R1.fastq.gz          data/raw/SC_lib1_R2.fastq.gz          ctrl        1
+SC_lib2         data/raw/SC_lib2_R1.fastq.gz          data/raw/SC_lib2_R2.fastq.gz          treat       1
+```
+
+<Tip>
+For 10x Genomics data, point `fastq_r1` to the read file and `fastq_r2` to the barcode/insert file as produced by `cellranger-atac mkfastq`. The Chromap rule passes reads directly to the aligner without assuming a particular barcode structure.
+</Tip>
+
+---
+
+## Pipeline Stages
+
+<Steps>
+
+### Preprocessing — fastp + FastQC
+
+Identical to bulk mode: fastp trims 5 bases from the front of both mates and enforces a minimum read length of 30 bp before FastQC generates per-sample HTML reports.
+
+```yaml
+# config.yaml
+fastp:
+  output: "results/preprocessing/fastp"
+  params:
+    trim_front1: 5
+    trim_front2: 5
+    length_required: 30
+  threads: 4
+  resources:
+    mem_mb: 8000
+    time: 120
+```
+
+### Alignment — Chromap
+
+Trimmed reads are aligned with Chromap using the `--preset atac` flag, which applies ATAC-seq–specific alignment parameters. The rule spawns 16 threads and requests 32 GB of memory to handle the large barcode-aware index:
+
+```yaml
+# config.yaml
+chromap:
+  input: "results/preprocessing/fastp"
+  output: "results/alignment/chromap"
+  params:
+    index: "data/reference/chromap/genome.index"   # *CHROMAP_INDEX
+    preset: "atac"
+  threads: 16
+  resources:
+    mem_mb: 32000
+    time: 120
+```
+
+The Chromap rule produces two output files per sample:
+
+| File | Description |
+|---|---|
+| `results/alignment/chromap/{sample}.bam` | Raw aligned BAM |
+| `results/alignment/chromap/{sample}_tag.bam` | SAM-converted tagged BAM fed to ArchR |
+
+The shell command executed by the rule is:
+
+```bash
+chromap \
+    --preset atac \
+    -x data/reference/chromap/genome.index \
+    -r data/reference/genome.fa \
+    -1 {sample}_R1_trimmed.fastq.gz \
+    -2 {sample}_R2_trimmed.fastq.gz \
+    -t 16 \
+    -o {sample}.bam \
+    --SAM
+```
+
+<Note>
+The QC gate that runs in bulk mode (FRiP, TSS enrichment, mapping rate, duplicate rate checks) is **not applied** in scATAC mode. ArchR enforces its own per-cell QC thresholds during Arrow file creation.
+</Note>
+
+### ArchR — Arrow File Creation
+
+All tagged BAMs are passed together to `archr_pseudobulk`, which creates ArchR Arrow files (one per sample). Cells below the minimum TSS enrichment or fragment count thresholds are excluded at this stage.
+
+```yaml
+# config.yaml
+archr:
+  input:
+    bam: "results/alignment/chromap"
+  output:
+    arrow: "results/scatac/archr/arrow"
+  params:
+    min_tss: 4.0
+    min_frags: 1000
+    max_frags: 100000
+    tsse_method: "ArchR"
+  threads: 16
+  resources:
+    mem_mb: 64000
+    time: 240
+```
+
+| Parameter | Value | Meaning |
+|---|---|---|
+| `min_tss` | 4.0 | Minimum TSS enrichment score per cell |
+| `min_frags` | 1000 | Minimum unique fragments per cell |
+| `max_frags` | 100000 | Maximum fragments (filters multiplets) |
+| `tsse_method` | ArchR | TSS enrichment algorithm |
+
+Arrow files are written to `results/scatac/archr/arrow/`.
+
+### ArchR — Doublet Detection and Filtering
+
+`archr_doublet_detection` runs ArchR's simulation-based doublet scoring on the raw Arrow files. Cells with a doublet enrichment score above `doublet_threshold: 0.2` are removed. A diagnostic PDF is written to `results/scatac/archr/doublets/doublet_enrichment.pdf` and the cleaned Arrow files are saved to `results/scatac/archr/filtered_arrow/`.
+
+```yaml
+# config.yaml (archr params excerpt)
+archr:
+  params:
+    doublet_threshold: 0.2
+```
+
+### ArchR — Iterative LSI, UMAP, and Clustering
+
+The filtered Arrow files feed `archr_clustering`, which runs the full single-cell analysis:
+
+1. **Iterative LSI** dimensionality reduction across dimensions `1:30`
+2. **UMAP** embedding of the LSI components
+3. **Leiden clustering** at resolution `0.8`
+4. **Marker gene and peak identification** per cluster
+
+```yaml
+# config.yaml (archr params excerpt)
+archr:
+  params:
+    clustering_resolution: 0.8
+    dims_to_use: 1:30
+    force_dim_reduction: true
+```
+
+<CardGroup cols={2}>
+  <Card title="Cell Clusters" icon="table">
+    `results/scatac/archr/clusters/cell_clusters.tsv` — barcode-to-cluster assignment table
+  </Card>
+  <Card title="UMAP Plot" icon="chart-scatter">
+    `results/scatac/archr/plots/umap_clusters.pdf` — UMAP coloured by cluster identity
+  </Card>
+  <Card title="Marker Genes" icon="dna">
+    `results/scatac/archr/markers/marker_genes.tsv` — per-cluster marker gene table
+  </Card>
+  <Card title="Full QC Report" icon="file-pdf">
+    `results/scatac/archr/qc_report/ArchR_full_report.pdf` — comprehensive ArchR PDF report
+  </Card>
+</CardGroup>
+
+### Cicero — Chromatin Co-Accessibility
+
+Cicero models co-accessibility between distal regulatory elements and gene promoters using the filtered Arrow files and the cluster assignments from ArchR. The analysis runs within a 500 bp tiling window and considers peak pairs up to 250 kb apart.
+
+```yaml
+# config.yaml
+cicero:
+  input:
+    arrow:    "results/scatac/archr/filtered_arrow"
+    clusters: "results/scatac/archr/clusters"
+  output:
+    connections: "results/scatac/cicero/connections"
+    ccans:       "results/scatac/cicero/ccans"
+    plots:       "results/scatac/cicero/plots"
+  params:
+    window_size:     500
+    distance_cutoff: 250000
+  threads: 8
+  resources:
+    mem_mb: 32000
+    time: 240
+```
+
+| Parameter | Value | Meaning |
+|---|---|---|
+| `window_size` | 500 | Tiling window size in bp |
+| `distance_cutoff` | 250000 | Maximum genomic distance for co-accessibility (250 kb) |
+
+Cicero outputs three primary files:
+
+| Output | Path | Description |
+|---|---|---|
+| Co-accessibility network | `connections/coaccessibility_connections.rds` | R object of full network |
+| Co-accessibility table | `connections/coaccessibility_table.tsv` | Peak-pair scores as TSV |
+| CCAN BED | `ccans/ccans.bed` | Cis-Coaccessibility Networks as BED intervals |
+
+### chromVAR Motif Deviations
+
+chromVAR computes per-cell motif deviation scores using the JASPAR vertebrate motif database and the Tn5-shifted signal. In scATAC mode, it operates on the Chromap-aligned BAMs alongside bigwig generation and correlation analysis.
+
+```yaml
+# config.yaml
+chromvar_analysis:
+  output:
+    deviations:     "results/peak_calling/chromvar/deviations"
+    bias_corrected: "results/peak_calling/chromvar/bias_corrected"
+    plots:          "results/peak_calling/chromvar/plots"
+  params:
+    motif_db:     "data/motifs/jaspar_vertebrates.meme"
+    genome_fa:    "data/reference/genome.fa"
+    genome_sizes: "data/reference/genome.chrom.sizes"
+  threads: 8
+  resources:
+    mem_mb: 16000
+    time: 240
+```
+
+Per-sample deviation scores are written to `results/peak_calling/chromvar/deviations/{sample}_deviations.tsv`.
+
+</Steps>
+
+---
+
+## Output Structure
+
+All scATAC outputs are written to `results/scatac/` in addition to the shared `results/visualization/` and `results/peak_calling/chromvar/` directories:
+
+```text
+results/
+├── preprocessing/
+│   ├── fastp/          # Trimmed FASTQs
+│   └── fastqc/         # FastQC HTML reports
+├── alignment/
+│   └── chromap/        # {sample}.bam and {sample}_tag.bam
+├── visualization/
+│   ├── bigwig/         # Per-sample BigWig tracks
+│   └── correlation_analysis/  # Correlation heatmap
+├── peak_calling/
+│   ├── motif_analysis/ # Per-sample HOMER motif results
+│   └── chromvar/
+│       ├── deviations/ # {sample}_deviations.tsv
+│       └── plots/
+└── scatac/
+    ├── archr/
+    │   ├── arrow/              # Raw Arrow files
+    │   ├── filtered_arrow/     # Doublet-filtered Arrow files
+    │   ├── clusters/
+    │   │   └── cell_clusters.tsv
+    │   ├── markers/
+    │   │   └── marker_genes.tsv
+    │   ├── doublets/
+    │   │   └── doublet_enrichment.pdf
+    │   ├── plots/
+    │   │   └── umap_clusters.pdf
+    │   └── qc_report/
+    │       └── ArchR_full_report.pdf
+    └── cicero/
+        ├── connections/
+        │   ├── coaccessibility_connections.rds
+        │   └── coaccessibility_table.tsv
+        ├── ccans/
+        │   └── ccans.bed
+        └── plots/
+            └── coaccessibility_plot.png
+```
+
+---
+
+## Key Differences from Bulk Mode
+
+<Accordion title="No pipeline-level QC gate">
+In bulk mode, `rules/scripts/parse_qc_metrics.py` applies hard thresholds for FRiP, TSS enrichment, mapping rate, and duplicate rate before peak calling. In scATAC mode this gate is skipped — the `QC_GATE_TARGETS` list is empty. ArchR enforces per-cell quality thresholds (`min_tss`, `min_frags`, `max_frags`) during Arrow file creation instead.
+</Accordion>
+
+<Accordion title="No post-alignment filtering chain">
+Bulk mode runs samtools sort → fixmate → markdup → view (MAPQ ≥ 30) → blacklist removal → Tn5 shift as a sequential chain on every BAM. In scATAC mode, `POST_FILTERING_TARGETS` is empty; Chromap's `--preset atac` handles alignment-level filtering internally and ArchR manages cell-level QC.
+</Accordion>
+
+<Accordion title="No IDR or DESeq2">
+IDR replicate concordance and DESeq2 differential accessibility are bulk-only steps. In scATAC mode, cluster-level differential accessibility is performed within ArchR using its marker peak identification routines.
+</Accordion>
+
+<Accordion title="No TOBIAS or HINT-ATAC footprinting">
+Transcription factor footprinting with TOBIAS and HINT-ATAC is not included in the scATAC rule graph. motif chromVAR provides single-cell–resolution motif deviation scores instead.
+</Accordion>

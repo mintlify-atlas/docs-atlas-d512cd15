@@ -1,0 +1,963 @@
+---
+title: "BDB ATAC-seq Pipeline: Full config.yaml Schema Reference"
+sidebarTitle: "Config Schema"
+description: "Complete reference for every top-level key and sub-key in config.yaml, including input/output paths, parameters, thread counts, and resource limits for each pipeline tool."
+---
+
+The `config.yaml` file is the single source of truth for the BDB-Genomics ATAC-seq framework. Every tool, path, resource limit, and QC threshold is declared here; Snakemake rules are stateless wrappers that read from this config at runtime. YAML anchors (e.g., `&GENOME_FA`, `*GENOME_FA`) centralise reference file paths so that changing one entry propagates everywhere automatically. Every tool block follows a uniform schema - `input → output → params → threads → resources` - making it straightforward to add new stages without touching existing ones.
+
+<Note>
+Raw FASTQ paths are **not** declared directly in `config.yaml`. They are resolved dynamically from the sample sheet defined at `global.samples` (a TSV file with columns `sample`, `fastq_r1`, `fastq_r2`, `replicate`, `condition`).
+</Note>
+
+---
+
+## Global / Project Metadata
+
+<Accordion title="global">
+Controls pipeline-wide behaviour, modality selection, and all shared reference file paths.
+
+**Purpose:** Declares the analysis mode, sample sheet location, and YAML anchors for genome references used by every downstream tool.
+
+<ParamField path="global.mode" type="string" default="bulk">
+  Pipeline modality. Use `"bulk"` for standard bulk ATAC-seq or `"scatac"` for single-cell ATAC-seq. Can also be overridden at runtime with the `ATAC_MODE` environment variable.
+</ParamField>
+
+<ParamField path="global.samples" type="string" default="data/fastp/samples.tsv">
+  Path to the TSV sample sheet. Required columns: `sample`, `fastq_r1`, `fastq_r2`, `replicate`, `condition`.
+</ParamField>
+
+<ParamField path="global.references.genome_fa" type="string" default="data/reference/genome.fa">
+  Path to the reference genome FASTA file. Anchored as `&GENOME_FA`; referenced by bowtie2, picard, TOBIAS, chromVAR, footprinting, and peak annotation rules.
+</ParamField>
+
+<ParamField path="global.references.genome_sizes" type="string" default="data/reference/genome.chrom.sizes">
+  Chromosome sizes file (two-column TSV: chrom, length). Anchored as `&GENOME_SIZES`; used by bedGraphToBigWig, TOBIAS, and chromVAR.
+</ParamField>
+
+<ParamField path="global.references.bowtie2_index" type="string" default="data/reference/index/genome">
+  Bowtie2 index prefix (without `.bt2` extension). Anchored as `&BOWTIE2_INDEX`.
+</ParamField>
+
+<ParamField path="global.references.chromap_index" type="string" default="data/reference/chromap/genome.index">
+  Chromap binary index file for scATAC-seq alignment. Anchored as `&CHROMAP_INDEX`.
+</ParamField>
+
+<ParamField path="global.references.blacklist" type="string" default="data/reference/ENCODE_blacklist.bed">
+  ENCODE blacklist BED file for filtering artefact regions. Anchored as `&BLACKLIST`.
+</ParamField>
+
+<ParamField path="global.references.annotation_gtf" type="string" default="data/reference/annotation.gtf">
+  Gene annotation GTF file used for TSS enrichment calculation and peak annotation. Anchored as `&ANNOTATION_GTF`.
+</ParamField>
+
+<ParamField path="global.references.motif_db" type="string" default="data/motifs/jaspar_vertebrates.meme">
+  MEME-format motif database (e.g., JASPAR vertebrates). Anchored as `&MOTIF_DB`; used by HOMER, TOBIAS, and chromVAR.
+</ParamField>
+</Accordion>
+
+---
+
+## Stage 1 - Preprocessing
+
+<Accordion title="fastp">
+**Purpose:** Adapter trimming and quality filtering of raw paired-end FASTQ files.
+
+**Output:** `results/preprocessing/fastp/`
+
+<ParamField path="fastp.output" type="string" default="results/preprocessing/fastp">
+  Directory for trimmed FASTQ files and fastp JSON reports.
+</ParamField>
+
+<ParamField path="fastp.params.trim_front1" type="integer" default="5">
+  Number of bases to trim from the 5′ end of Read 1.
+</ParamField>
+
+<ParamField path="fastp.params.trim_front2" type="integer" default="5">
+  Number of bases to trim from the 5′ end of Read 2.
+</ParamField>
+
+<ParamField path="fastp.params.length_required" type="integer" default="30">
+  Minimum read length after trimming; shorter reads are discarded.
+</ParamField>
+
+<ParamField path="fastp.threads" type="integer" default="4">
+  CPU threads allocated to fastp.
+</ParamField>
+
+<ParamField path="fastp.resources.mem_mb" type="integer" default="8000">
+  Memory limit in megabytes.
+</ParamField>
+
+<ParamField path="fastp.resources.time" type="integer" default="120">
+  Wall-clock time limit in minutes.
+</ParamField>
+</Accordion>
+
+<Accordion title="fastqc">
+**Purpose:** Post-trimming quality control report generation.
+
+**Input:** `results/preprocessing/fastp/` (R1 and R2 trimmed reads)
+
+**Output:** `results/preprocessing/fastqc/`
+
+<ParamField path="fastqc.threads" type="integer" default="4">
+  CPU threads allocated to FastQC.
+</ParamField>
+
+<ParamField path="fastqc.resources.mem_mb" type="integer" default="2000">
+  Memory limit in megabytes.
+</ParamField>
+
+<ParamField path="fastqc.resources.time" type="integer" default="30">
+  Wall-clock time limit in minutes.
+</ParamField>
+</Accordion>
+
+---
+
+## Stage 2 - Alignment
+
+<Accordion title="bowtie2">
+**Purpose:** Paired-end alignment of trimmed reads to the reference genome (bulk ATAC-seq mode).
+
+**Input:** `results/preprocessing/fastp/`
+
+**Output:** `results/alignment/bowtie2/`
+
+<ParamField path="bowtie2.params.index" type="string" default="*BOWTIE2_INDEX">
+  Bowtie2 index prefix, resolved from the `global.references.bowtie2_index` anchor.
+</ParamField>
+
+<ParamField path="bowtie2.params.sensitive" type="string" default="--very-sensitive">
+  Alignment sensitivity flag passed directly to `bowtie2`.
+</ParamField>
+
+<ParamField path="bowtie2.threads" type="integer" default="8">
+  CPU threads allocated to bowtie2.
+</ParamField>
+
+<ParamField path="bowtie2.resources.mem_mb" type="integer" default="16000">
+  Memory limit in megabytes.
+</ParamField>
+
+<ParamField path="bowtie2.resources.time" type="integer" default="240">
+  Wall-clock time limit in minutes.
+</ParamField>
+</Accordion>
+
+<Accordion title="chromap (scATAC-seq)">
+**Purpose:** Fast single-cell ATAC-seq read alignment using the Chromap aligner (`--preset atac`). Only active when `global.mode = "scatac"`.
+
+**Input:** `results/preprocessing/fastp/`
+
+**Output:** `results/alignment/chromap/`
+
+<ParamField path="chromap.params.index" type="string" default="*CHROMAP_INDEX">
+  Chromap binary index, resolved from the `global.references.chromap_index` anchor.
+</ParamField>
+
+<ParamField path="chromap.params.preset" type="string" default="atac">
+  Chromap preset. Always `"atac"` for ATAC-seq data.
+</ParamField>
+
+<ParamField path="chromap.threads" type="integer" default="16">
+  CPU threads allocated to Chromap.
+</ParamField>
+
+<ParamField path="chromap.resources.mem_mb" type="integer" default="32000">
+  Memory limit in megabytes.
+</ParamField>
+
+<ParamField path="chromap.resources.time" type="integer" default="120">
+  Wall-clock time limit in minutes.
+</ParamField>
+</Accordion>
+
+---
+
+## Stage 3 - Post-Alignment Processing
+
+<Accordion title="samtools_sort">
+**Purpose:** Coordinate-sorts the raw BAM produced by Bowtie2.
+
+**Input:** `results/alignment/bowtie2/`
+
+**Output:** `results/post_alignment/samtools_sort/`
+
+<ParamField path="samtools_sort.threads" type="integer" default="4">CPU threads.</ParamField>
+<ParamField path="samtools_sort.resources.mem_mb" type="integer" default="8000">Memory limit (MB).</ParamField>
+<ParamField path="samtools_sort.resources.time" type="integer" default="120">Time limit (minutes).</ParamField>
+</Accordion>
+
+<Accordion title="mitoATAC_calculate">
+**Purpose:** Calculates mitochondrial read fractions before deduplication for QC reporting.
+
+**Input:** `results/post_alignment/samtools_sort/`
+
+**Output:** `results/post_alignment/mito-ATAC/`
+
+<ParamField path="mitoATAC_calculate.params.mito_chr" type="string" default="chrMT">
+  Chromosome name for the mitochondrial contig. Common alternatives: `chrM`, `MT`.
+</ParamField>
+
+<ParamField path="mitoATAC_calculate.threads" type="integer" default="2">CPU threads.</ParamField>
+<ParamField path="mitoATAC_calculate.resources.mem_mb" type="integer" default="4000">Memory limit (MB).</ParamField>
+<ParamField path="mitoATAC_calculate.resources.time" type="integer" default="30">Time limit (minutes).</ParamField>
+</Accordion>
+
+<Accordion title="samtools_fixmate">
+**Purpose:** Fills in mate-score tags required by `samtools markdup`.
+
+**Input:** `results/post_alignment/samtools_sort/`
+
+**Output:** `results/post_alignment/samtools_fixmate/`
+
+<ParamField path="samtools_fixmate.threads" type="integer" default="2">CPU threads.</ParamField>
+<ParamField path="samtools_fixmate.resources.mem_mb" type="integer" default="2000">Memory limit (MB).</ParamField>
+<ParamField path="samtools_fixmate.resources.time" type="integer" default="30">Time limit (minutes).</ParamField>
+</Accordion>
+
+<Accordion title="samtools_markdup">
+**Purpose:** Marks (and optionally removes) PCR duplicates.
+
+**Input:** `results/post_alignment/samtools_fixmate/`
+
+**Output:** `results/post_alignment/samtools_markdup/`
+
+<ParamField path="samtools_markdup.params.remove_duplicates" type="boolean" default="false">
+  When `false`, duplicates are marked but retained. Set to `true` to remove them entirely.
+</ParamField>
+
+<ParamField path="samtools_markdup.threads" type="integer" default="4">CPU threads.</ParamField>
+<ParamField path="samtools_markdup.resources.mem_mb" type="integer" default="8000">Memory limit (MB).</ParamField>
+<ParamField path="samtools_markdup.resources.time" type="integer" default="120">Time limit (minutes).</ParamField>
+</Accordion>
+
+<Accordion title="samtools_index_post_markdup">
+**Purpose:** Indexes the deduplicated BAM so Picard and downstream rules can random-access it.
+
+**Input:** `results/post_alignment/samtools_markdup/`
+
+**Output:** `results/post_alignment/samtools_index/post_markdup/`
+
+<ParamField path="samtools_index_post_markdup.threads" type="integer" default="2">CPU threads.</ParamField>
+<ParamField path="samtools_index_post_markdup.resources.mem_mb" type="integer" default="2000">Memory limit (MB).</ParamField>
+<ParamField path="samtools_index_post_markdup.resources.time" type="integer" default="30">Time limit (minutes).</ParamField>
+</Accordion>
+
+<Accordion title="remove_mito_reads">
+**Purpose:** Removes mitochondrial reads from the deduplicated BAM using exact chromosome matching.
+
+**Input:** `results/post_alignment/samtools_markdup/`
+
+**Output:** `results/post_alignment/remove_mito_reads/`
+
+<ParamField path="remove_mito_reads.params.mito_chr" type="string" default="chrMT">
+  Mitochondrial contig name to exclude. Must match the contig name in the BAM header.
+</ParamField>
+
+<ParamField path="remove_mito_reads.threads" type="integer" default="2">CPU threads.</ParamField>
+<ParamField path="remove_mito_reads.resources.mem_mb" type="integer" default="2000">Memory limit (MB).</ParamField>
+<ParamField path="remove_mito_reads.resources.time" type="integer" default="30">Time limit (minutes).</ParamField>
+</Accordion>
+
+<Accordion title="samtools_index">
+**Purpose:** Indexes the mitochondrial-free sorted BAM.
+
+**Input:** `results/post_alignment/remove_mito_reads/`
+
+**Output:** `results/post_alignment/samtools_index/`
+
+<ParamField path="samtools_index.threads" type="integer" default="2">CPU threads.</ParamField>
+<ParamField path="samtools_index.resources.mem_mb" type="integer" default="2000">Memory limit (MB).</ParamField>
+<ParamField path="samtools_index.resources.time" type="integer" default="30">Time limit (minutes).</ParamField>
+</Accordion>
+
+<Accordion title="samtools_view">
+**Purpose:** Filters reads by MAPQ and SAM flags, retaining only high-quality properly paired alignments.
+
+**Input:** `results/post_alignment/remove_mito_reads/`
+
+**Output:** `results/post_alignment/samtools_view/`
+
+<ParamField path="samtools_view.params.MAPQ" type="integer" default="30">
+  Minimum mapping quality score. Reads below this threshold are discarded.
+</ParamField>
+
+<ParamField path="samtools_view.params.flags" type="integer" default="3844">
+  Bitwise SAM flag filter (`-F`). The default `3844` excludes unmapped, mate-unmapped, not-primary, failing QC, and supplementary alignments.
+</ParamField>
+
+<ParamField path="samtools_view.threads" type="integer" default="2">CPU threads.</ParamField>
+<ParamField path="samtools_view.resources.mem_mb" type="integer" default="2000">Memory limit (MB).</ParamField>
+<ParamField path="samtools_view.resources.time" type="integer" default="30">Time limit (minutes).</ParamField>
+</Accordion>
+
+<Accordion title="remove_blacklist_reads">
+**Purpose:** Removes reads overlapping ENCODE blacklist regions using `bedtools intersect`.
+
+**Input:** `results/post_alignment/samtools_view/` + `global.references.blacklist`
+
+**Output:** `results/post_alignment/samtools_view/` (clean BAM replaces the filtered BAM in-place by convention)
+
+<ParamField path="remove_blacklist_reads.threads" type="integer" default="2">CPU threads.</ParamField>
+<ParamField path="remove_blacklist_reads.resources.mem_mb" type="integer" default="4000">Memory limit (MB).</ParamField>
+<ParamField path="remove_blacklist_reads.resources.time" type="integer" default="30">Time limit (minutes).</ParamField>
+</Accordion>
+
+<Accordion title="samtools_index_post_filter">
+**Purpose:** Indexes the blacklist-filtered BAM. The `.bai` index file is placed alongside the BAM in the same directory.
+
+**Input / Output:** `results/post_alignment/samtools_view/`
+
+<ParamField path="samtools_index_post_filter.threads" type="integer" default="2">CPU threads.</ParamField>
+<ParamField path="samtools_index_post_filter.resources.mem_mb" type="integer" default="2000">Memory limit (MB).</ParamField>
+<ParamField path="samtools_index_post_filter.resources.time" type="integer" default="30">Time limit (minutes).</ParamField>
+</Accordion>
+
+<Accordion title="tn5_shift">
+**Purpose:** Applies the Tn5 transposase insertion bias shift (+4 bp on the forward strand, −5 bp on the reverse strand) using `alignmentSieve`.
+
+**Input:** `results/post_alignment/samtools_view/`
+
+**Output:** `results/post_alignment/tn5_shift/` (shifted BAM + index)
+
+<ParamField path="tn5_shift.threads" type="integer" default="4">CPU threads.</ParamField>
+<ParamField path="tn5_shift.resources.mem_mb" type="integer" default="4000">Memory limit (MB).</ParamField>
+<ParamField path="tn5_shift.resources.time" type="integer" default="60">Time limit (minutes).</ParamField>
+</Accordion>
+
+<Accordion title="samtools_stats">
+**Purpose:** Generates comprehensive alignment statistics used by the QC gate (mapping rate, duplicate rate).
+
+**Input:** `results/post_alignment/remove_mito_reads/`
+
+**Output:** `results/post_alignment/samtools_stats/`
+
+<ParamField path="samtools_stats.threads" type="integer" default="2">CPU threads.</ParamField>
+<ParamField path="samtools_stats.resources.mem_mb" type="integer" default="2000">Memory limit (MB).</ParamField>
+<ParamField path="samtools_stats.resources.time" type="integer" default="30">Time limit (minutes).</ParamField>
+</Accordion>
+
+---
+
+## Stage 4 - Metrics & QC
+
+<Accordion title="fragment_size_analysis">
+**Purpose:** Analyses nucleosomal banding patterns from Picard insert-size metrics (sub-nucleosomal &lt;200 bp, mono-nucleosomal 200-400 bp, di-nucleosomal &gt;400 bp).
+
+**Input:** `results/metrics_qc/picard/CollectInsertSizeMetrics/`
+
+**Output:** `results/metrics_qc/fragment_size_analysis/`
+
+<ParamField path="fragment_size_analysis.params.min_length" type="integer" default="30">
+  Minimum fragment length to include in the analysis.
+</ParamField>
+
+<ParamField path="fragment_size_analysis.params.max_length" type="integer" default="1000">
+  Maximum fragment length to include in the analysis.
+</ParamField>
+
+<ParamField path="fragment_size_analysis.params.max_fragment" type="integer" default="1000">
+  Upper x-axis limit for fragment size histogram plots.
+</ParamField>
+
+<ParamField path="fragment_size_analysis.threads" type="integer" default="4">CPU threads.</ParamField>
+<ParamField path="fragment_size_analysis.resources.mem_mb" type="integer" default="4000">Memory limit (MB).</ParamField>
+<ParamField path="fragment_size_analysis.resources.time" type="integer" default="60">Time limit (minutes).</ParamField>
+</Accordion>
+
+<Accordion title="tss_enrichment">
+**Purpose:** Calculates TSS enrichment score by computing normalised signal across ±2 kb windows around annotated transcription start sites.
+
+**Input:** Tn5-shifted BAM + index (`results/post_alignment/tn5_shift/`)
+
+**Output:** `results/metrics_qc/tss_enrichment/`
+
+**Script:** `rules/scripts/tss_enrichment.R`
+
+<ParamField path="tss_enrichment.params.annotation" type="string" default="*ANNOTATION_GTF">
+  Gene annotation GTF, resolved from `global.references.annotation_gtf`.
+</ParamField>
+
+<ParamField path="tss_enrichment.params.upstream" type="integer" default="2000">
+  Base pairs upstream of the TSS to include in the enrichment window.
+</ParamField>
+
+<ParamField path="tss_enrichment.params.downstream" type="integer" default="2000">
+  Base pairs downstream of the TSS to include in the enrichment window.
+</ParamField>
+
+<ParamField path="tss_enrichment.threads" type="integer" default="4">CPU threads.</ParamField>
+<ParamField path="tss_enrichment.resources.mem_mb" type="integer" default="4000">Memory limit (MB).</ParamField>
+<ParamField path="tss_enrichment.resources.time" type="integer" default="60">Time limit (minutes).</ParamField>
+</Accordion>
+
+<Accordion title="picard - alignment_metrics">
+**Purpose:** Collects alignment summary metrics (total reads, mapped rate, strand balance) from the deduplicated BAM.
+
+**Input:** `results/post_alignment/samtools_markdup/`
+
+**Output:** `results/metrics_qc/picard/CollectAlignmentSummaryMetrics/`
+
+<ParamField path="picard.alignment_metrics.params.reference_genome" type="string" default="*GENOME_FA">
+  Reference FASTA for validation, resolved from `global.references.genome_fa`.
+</ParamField>
+
+<ParamField path="picard.alignment_metrics.params.validation_stringency" type="string" default="LENIENT">
+  Picard validation stringency. `LENIENT` suppresses non-critical warnings from legacy BAM files.
+</ParamField>
+
+<ParamField path="picard.alignment_metrics.threads" type="integer" default="4">CPU threads.</ParamField>
+<ParamField path="picard.alignment_metrics.resources.mem_mb" type="integer" default="4000">Memory limit (MB).</ParamField>
+<ParamField path="picard.alignment_metrics.resources.time" type="integer" default="60">Time limit (minutes).</ParamField>
+</Accordion>
+
+<Accordion title="picard - insert_metrics">
+**Purpose:** Collects insert-size distribution metrics used for fragment size analysis and nucleosome banding QC.
+
+**Input:** `results/post_alignment/samtools_markdup/`
+
+**Output (metrics + histogram):** `results/metrics_qc/picard/CollectInsertSizeMetrics/`
+
+<ParamField path="picard.insert_metrics.params.M" type="float" default="0.05">
+  Minimum fraction of reads required for a histogram data point to be plotted.
+</ParamField>
+
+<ParamField path="picard.insert_metrics.params.validation_stringency" type="string" default="LENIENT">
+  Picard validation stringency.
+</ParamField>
+
+<ParamField path="picard.insert_metrics.threads" type="integer" default="4">CPU threads.</ParamField>
+<ParamField path="picard.insert_metrics.resources.mem_mb" type="integer" default="4000">Memory limit (MB).</ParamField>
+<ParamField path="picard.insert_metrics.resources.time" type="integer" default="60">Time limit (minutes).</ParamField>
+</Accordion>
+
+<Accordion title="cross_correlation">
+**Purpose:** Computes NSC (Normalized Strand Cross-correlation) and RSC (Relative Strand Cross-correlation) coefficients via phantompeakqualtools. ENCODE-compliant strand-shift QC.
+
+**Input:** `results/post_alignment/samtools_view/`
+
+**Output:** `results/metrics_qc/cross_correlation/`
+
+<ParamField path="cross_correlation.params.num_threads" type="integer" default="4">
+  Threads passed internally to the R-based cross-correlation tool.
+</ParamField>
+
+<ParamField path="cross_correlation.params.max_range" type="integer" default="150">
+  Maximum strand-shift range (bp) to evaluate for the cross-correlation curve.
+</ParamField>
+
+<ParamField path="cross_correlation.threads" type="integer" default="4">CPU threads.</ParamField>
+<ParamField path="cross_correlation.resources.mem_mb" type="integer" default="8000">Memory limit (MB).</ParamField>
+<ParamField path="cross_correlation.resources.time" type="integer" default="120">Time limit (minutes).</ParamField>
+</Accordion>
+
+<Accordion title="preseq">
+**Purpose:** Estimates library complexity and predicts yield at higher sequencing depths using a curve extrapolation model.
+
+**Input:** `results/post_alignment/remove_mito_reads/`
+
+**Output:** `results/reporting_qc/preseq/`
+
+<ParamField path="preseq.threads" type="integer" default="1">CPU threads (single-threaded tool).</ParamField>
+<ParamField path="preseq.resources.mem_mb" type="integer" default="4000">Memory limit (MB).</ParamField>
+<ParamField path="preseq.resources.time" type="integer" default="60">Time limit (minutes).</ParamField>
+</Accordion>
+
+<Accordion title="qualimap_bamqc">
+**Purpose:** Generates comprehensive BAM QC metrics including coverage uniformity, GC content, and read distribution.
+
+**Input:** `results/post_alignment/samtools_markdup/`
+
+**Output:** `results/reporting_qc/qualimap/`
+
+<ParamField path="qualimap_bamqc.threads" type="integer" default="4">CPU threads.</ParamField>
+<ParamField path="qualimap_bamqc.resources.mem_mb" type="integer" default="4000">Memory limit (MB).</ParamField>
+<ParamField path="qualimap_bamqc.resources.time" type="integer" default="60">Time limit (minutes).</ParamField>
+</Accordion>
+
+---
+
+## QC Gate
+
+<Accordion title="qc_gate">
+**Purpose:** Automated biological checkpoint. Evaluates four gated metrics - FRiP, TSS enrichment, mapping rate, and duplicate rate - and writes per-sample pass/fail files that downstream rules depend on.
+
+**Inputs:**
+- FRiP file: `results/peak_calling/frip_calculation/`
+- TSS enrichment file: `results/metrics_qc/tss_enrichment/`
+- Samtools stats: `results/post_alignment/samtools_stats/`
+
+**Output:** `results/qc_gate/`
+
+<ParamField path="qc_gate.params.min_frip" type="float" default="0.2">
+  Minimum FRiP (Fraction of Reads in Peaks). ENCODE minimum recommendation.
+</ParamField>
+
+<ParamField path="qc_gate.params.min_tss_enr" type="float" default="7.0">
+  Minimum TSS Enrichment score. Signal at TSSes relative to background.
+</ParamField>
+
+<ParamField path="qc_gate.params.min_mapping_rate" type="float" default="80.0">
+  Minimum percentage of properly paired reads (from `samtools stats`).
+</ParamField>
+
+<ParamField path="qc_gate.params.max_duplicate_rate" type="float" default="20.0">
+  Maximum duplicate rate percentage - `(reads_duplicated / total_reads) × 100`.
+</ParamField>
+
+<ParamField path="qc_gate.threads" type="integer" default="1">CPU threads.</ParamField>
+<ParamField path="qc_gate.resources.mem_mb" type="integer" default="1000">Memory limit (MB).</ParamField>
+<ParamField path="qc_gate.resources.time" type="integer" default="10">Time limit (minutes).</ParamField>
+</Accordion>
+
+---
+
+## Stage 5 - Visualization
+
+<Accordion title="bedtools_genomecov">
+**Purpose:** Converts the Tn5-shifted BAM to a raw bedGraph coverage track.
+
+**Input:** `results/post_alignment/tn5_shift/`
+
+**Output:** `results/visualization/bedtools_genomecov/`
+
+<ParamField path="bedtools_genomecov.params.extra" type="string" default="-bg">
+  Extra flags passed to `bedtools genomecov`. `-bg` produces bedGraph format.
+</ParamField>
+
+<ParamField path="bedtools_genomecov.threads" type="integer" default="4">CPU threads.</ParamField>
+<ParamField path="bedtools_genomecov.resources.mem_mb" type="integer" default="4000">Memory limit (MB).</ParamField>
+<ParamField path="bedtools_genomecov.resources.time" type="integer" default="60">Time limit (minutes).</ParamField>
+</Accordion>
+
+<Accordion title="sorted_bedgraph">
+**Purpose:** Sorts the bedGraph file by chromosome and coordinate (required by `bedGraphToBigWig`).
+
+**Input:** `results/visualization/bedtools_genomecov/`
+
+**Output:** `results/visualization/sorted_bedgraph_file/`
+
+<ParamField path="sorted_bedgraph.threads" type="integer" default="4">CPU threads.</ParamField>
+<ParamField path="sorted_bedgraph.resources.mem_mb" type="integer" default="4000">Memory limit (MB).</ParamField>
+<ParamField path="sorted_bedgraph.resources.time" type="integer" default="60">Time limit (minutes).</ParamField>
+</Accordion>
+
+<Accordion title="bigwig">
+**Purpose:** Converts the sorted bedGraph to a binary BigWig file for genome browser visualisation.
+
+**Input:** `results/visualization/sorted_bedgraph_file/`
+
+**Output:** `results/visualization/bigwig/`
+
+<ParamField path="bigwig.params.genome" type="string" default="*GENOME_SIZES">
+  Chromosome sizes file, resolved from `global.references.genome_sizes`.
+</ParamField>
+
+<ParamField path="bigwig.threads" type="integer" default="4">CPU threads.</ParamField>
+<ParamField path="bigwig.resources.mem_mb" type="integer" default="4000">Memory limit (MB).</ParamField>
+<ParamField path="bigwig.resources.time" type="integer" default="60">Time limit (minutes).</ParamField>
+</Accordion>
+
+<Accordion title="normalized_coverage">
+**Purpose:** Generates CPM-normalised BigWig tracks for cross-sample comparability using `bamCoverage`.
+
+**Input:** `results/post_alignment/tn5_shift/`
+
+**Output:** `results/visualization/normalized_coverage/`
+
+<ParamField path="normalized_coverage.params.method" type="string" default="CPM">
+  Normalisation method passed to `bamCoverage`. Options: `CPM`, `RPKM`, `BPM`, `RPGC`, `None`.
+</ParamField>
+
+<ParamField path="normalized_coverage.threads" type="integer" default="4">CPU threads.</ParamField>
+<ParamField path="normalized_coverage.resources.mem_mb" type="integer" default="8000">Memory limit (MB).</ParamField>
+<ParamField path="normalized_coverage.resources.time" type="integer" default="120">Time limit (minutes).</ParamField>
+</Accordion>
+
+<Accordion title="correlation_analysis">
+**Purpose:** Computes inter-sample Pearson/Spearman correlations across BigWig tracks using deepTools `multiBigwigSummary` + `plotCorrelation`.
+
+**Input:** `results/visualization/bigwig/`
+
+**Output:** `results/visualization/correlation_analysis/`
+
+<ParamField path="correlation_analysis.params.bin_size" type="integer" default="1000">
+  Genomic bin size in base pairs used for signal summarisation before correlation.
+</ParamField>
+
+<ParamField path="correlation_analysis.threads" type="integer" default="4">CPU threads.</ParamField>
+<ParamField path="correlation_analysis.resources.mem_mb" type="integer" default="8000">Memory limit (MB).</ParamField>
+<ParamField path="correlation_analysis.resources.time" type="integer" default="120">Time limit (minutes).</ParamField>
+</Accordion>
+
+<Accordion title="heatmap">
+**Purpose:** Generates read-density heatmaps centred on filtered peak regions using deepTools `computeMatrix` + `plotHeatmap`.
+
+**Inputs:**
+- `results/peak_calling/filtered_peaks/`
+- `results/visualization/bigwig/`
+
+**Outputs:**
+- Plot: `results/visualization/heatmap/plot/`
+- Matrix: `results/visualization/heatmap/matrix/`
+- Regions: `results/visualization/heatmap/`
+
+<ParamField path="heatmap.params.color" type="string" default="coolwarm">
+  Colormap name for the heatmap. Any matplotlib colormap is accepted.
+</ParamField>
+
+<ParamField path="heatmap.params.upstream" type="integer" default="3000">
+  Base pairs upstream of peak centre to include.
+</ParamField>
+
+<ParamField path="heatmap.params.downstream" type="integer" default="3000">
+  Base pairs downstream of peak centre to include.
+</ParamField>
+
+<ParamField path="heatmap.threads" type="integer" default="8">CPU threads.</ParamField>
+<ParamField path="heatmap.resources.mem_mb" type="integer" default="16000">Memory limit (MB).</ParamField>
+<ParamField path="heatmap.resources.time" type="integer" default="240">Time limit (minutes).</ParamField>
+</Accordion>
+
+---
+
+## Stage 6 - Peak Calling
+
+<Accordion title="macs2">
+**Purpose:** Calls chromatin accessibility peaks from the Tn5-shifted BAM in paired-end BAM mode.
+
+**Input:** `results/post_alignment/tn5_shift/`
+
+**Output:** `results/peak_calling/macs2_peakcall/`
+
+<ParamField path="macs2.params.genome_size" type="string" default="hs">
+  Effective genome size. Use `"hs"` (human), `"mm"` (mouse), `"ce"` (C. elegans), `"dm"` (Drosophila), or a numeric value.
+</ParamField>
+
+<ParamField path="macs2.params.qvalue" type="float" default="0.01">
+  Minimum q-value (FDR) threshold for peak calling.
+</ParamField>
+
+<ParamField path="macs2.params.nomodel" type="string" default="--nomodel">
+  Disables MACS2's shift model estimation. Required for ATAC-seq data.
+</ParamField>
+
+<ParamField path="macs2.params.format" type="string" default="BAMPE">
+  Input format flag. `BAMPE` instructs MACS2 to use both mates of a paired-end BAM.
+</ParamField>
+
+<ParamField path="macs2.threads" type="integer" default="8">CPU threads.</ParamField>
+<ParamField path="macs2.resources.mem_mb" type="integer" default="16000">Memory limit (MB).</ParamField>
+<ParamField path="macs2.resources.time" type="integer" default="240">Time limit (minutes).</ParamField>
+</Accordion>
+
+<Accordion title="blacklist_filter">
+**Purpose:** Removes peaks overlapping ENCODE blacklist regions from the MACS2 narrowPeak output.
+
+**Input:** `results/peak_calling/macs2_peakcall/`
+
+**Output:** `results/peak_calling/filtered_peaks/`
+
+<ParamField path="blacklist_filter.params.blacklist" type="string" default="*BLACKLIST">
+  Blacklist BED file, resolved from `global.references.blacklist`.
+</ParamField>
+
+<ParamField path="blacklist_filter.threads" type="integer" default="4">CPU threads.</ParamField>
+<ParamField path="blacklist_filter.resources.mem_mb" type="integer" default="4000">Memory limit (MB).</ParamField>
+<ParamField path="blacklist_filter.resources.time" type="integer" default="60">Time limit (minutes).</ParamField>
+</Accordion>
+
+<Accordion title="frip_calculation">
+**Purpose:** Computes the FRiP score - fraction of total reads overlapping filtered peak regions.
+
+**Inputs:**
+- Filtered peaks: `results/peak_calling/filtered_peaks/`
+- Shifted BAM: `results/post_alignment/tn5_shift/`
+
+**Output:** `results/peak_calling/frip_calculation/`
+
+<ParamField path="frip_calculation.threads" type="integer" default="4">CPU threads.</ParamField>
+<ParamField path="frip_calculation.resources.mem_mb" type="integer" default="2000">Memory limit (MB).</ParamField>
+<ParamField path="frip_calculation.resources.time" type="integer" default="15">Time limit (minutes).</ParamField>
+</Accordion>
+
+<Accordion title="peak_annotation">
+**Purpose:** Annotates filtered peaks with genomic features (promoter, intron, exon, intergenic) using HOMER or ChIPseeker.
+
+**Input:** `results/peak_calling/filtered_peaks/`
+
+**Output:** `results/peak_calling/peak_annotation/`
+
+<ParamField path="peak_annotation.params.gff" type="string" default="*ANNOTATION_GTF">
+  Annotation GTF resolved from `global.references.annotation_gtf`.
+</ParamField>
+
+<ParamField path="peak_annotation.params.genome" type="string" default="*GENOME_FA">
+  Reference FASTA resolved from `global.references.genome_fa`.
+</ParamField>
+
+<ParamField path="peak_annotation.threads" type="integer" default="8">CPU threads.</ParamField>
+<ParamField path="peak_annotation.resources.mem_mb" type="integer" default="16000">Memory limit (MB).</ParamField>
+<ParamField path="peak_annotation.resources.time" type="integer" default="240">Time limit (minutes).</ParamField>
+</Accordion>
+
+<Accordion title="motif_analysis">
+**Purpose:** Performs de novo and known motif enrichment analysis in filtered peaks using HOMER.
+
+**Input:** `results/peak_calling/filtered_peaks/`
+
+**Output:** `results/peak_calling/motif_analysis/`
+
+<ParamField path="motif_analysis.params.motif_db" type="string" default="*MOTIF_DB">
+  MEME-format motif database, resolved from `global.references.motif_db`.
+</ParamField>
+
+<ParamField path="motif_analysis.params.genome_assembly" type="string" default="*GENOME_FA">
+  Reference genome FASTA or assembly name.
+</ParamField>
+
+<ParamField path="motif_analysis.threads" type="integer" default="8">CPU threads.</ParamField>
+<ParamField path="motif_analysis.resources.mem_mb" type="integer" default="16000">Memory limit (MB).</ParamField>
+<ParamField path="motif_analysis.resources.time" type="integer" default="240">Time limit (minutes).</ParamField>
+</Accordion>
+
+<Accordion title="idr">
+**Purpose:** Computes Irreproducible Discovery Rate between biological replicates to assess peak reproducibility.
+
+**Outputs:**
+- IDR peaks: `results/peak_calling/idr/idr_peaks/`
+- Optimal peaks: `results/peak_calling/idr/optimal_peaks/`
+- Plots: `results/peak_calling/idr/plots/`
+
+<ParamField path="idr.params.idr_threshold" type="float" default="0.05">
+  IDR significance threshold. Peaks below this value are considered reproducible.
+</ParamField>
+
+<ParamField path="idr.params.rank_column" type="string" default="score">
+  Column used to rank peaks before IDR analysis.
+</ParamField>
+
+<ParamField path="idr.threads" type="integer" default="4">CPU threads.</ParamField>
+<ParamField path="idr.resources.mem_mb" type="integer" default="4000">Memory limit (MB).</ParamField>
+<ParamField path="idr.resources.time" type="integer" default="60">Time limit (minutes).</ParamField>
+</Accordion>
+
+<Accordion title="consensus_peaks">
+**Purpose:** Merges peaks across all samples into a single non-redundant consensus peak set.
+
+**Outputs:**
+- Consensus BED: `results/peak_calling/consensus_peaks/`
+- Sample count matrix: `results/peak_calling/consensus_peaks/`
+
+<ParamField path="consensus_peaks.params.min_samples" type="integer" default="2">
+  Minimum number of samples in which a peak must be called to be retained in the consensus set.
+</ParamField>
+
+<ParamField path="consensus_peaks.params.merge_distance" type="integer" default="100">
+  Maximum distance in base pairs between peaks to be merged into one consensus region.
+</ParamField>
+
+<ParamField path="consensus_peaks.threads" type="integer" default="4">CPU threads.</ParamField>
+<ParamField path="consensus_peaks.resources.mem_mb" type="integer" default="8000">Memory limit (MB).</ParamField>
+<ParamField path="consensus_peaks.resources.time" type="integer" default="120">Time limit (minutes).</ParamField>
+</Accordion>
+
+<Accordion title="count_peaks">
+**Purpose:** Counts reads in consensus peak regions across all samples to build a count matrix for DESeq2 differential accessibility analysis.
+
+**Input:** `results/post_alignment/tn5_shift/`
+
+**Output:** `results/peak_calling/count_peaks/`
+
+<ParamField path="count_peaks.threads" type="integer" default="2">CPU threads.</ParamField>
+<ParamField path="count_peaks.resources.mem_mb" type="integer" default="2000">Memory limit (MB).</ParamField>
+<ParamField path="count_peaks.resources.time" type="integer" default="30">Time limit (minutes).</ParamField>
+</Accordion>
+
+<Accordion title="differential_accessibility">
+**Purpose:** DESeq2-based differential chromatin accessibility analysis between conditions, with volcano, MA, and PCA plots.
+
+**Outputs:**
+- Results table: `results/peak_calling/differential_accessibility/`
+- Plots: `results/peak_calling/differential_accessibility/plots/`
+
+<ParamField path="differential_accessibility.params.fdr_threshold" type="float" default="0.05">
+  Adjusted p-value (FDR) threshold for significance.
+</ParamField>
+
+<ParamField path="differential_accessibility.params.log2fc_threshold" type="float" default="1.0">
+  Minimum absolute log₂ fold-change for a peak to be considered differentially accessible.
+</ParamField>
+
+<ParamField path="differential_accessibility.threads" type="integer" default="8">CPU threads.</ParamField>
+<ParamField path="differential_accessibility.resources.mem_mb" type="integer" default="16000">Memory limit (MB).</ParamField>
+<ParamField path="differential_accessibility.resources.time" type="integer" default="240">Time limit (minutes).</ParamField>
+</Accordion>
+
+<Accordion title="tobias">
+**Purpose:** Full TOBIAS pipeline (ATACorrect → ScoreBigwig → BINDetect) for bias-corrected transcription factor footprinting and differential TF binding analysis.
+
+**Input:** `results/post_alignment/samtools_view/`
+
+**Outputs:**
+- Bias-corrected BigWig: `results/peak_calling/tobias/corrected_bw/`
+- Footprint scores: `results/peak_calling/tobias/footprint_bw/`
+- BINDetect results: `results/peak_calling/tobias/bindetect/`
+
+<ParamField path="tobias.params.genome_fa" type="string" default="*GENOME_FA">Reference FASTA.</ParamField>
+<ParamField path="tobias.params.genome_sizes" type="string" default="*GENOME_SIZES">Chromosome sizes file.</ParamField>
+<ParamField path="tobias.params.blacklist" type="string" default="*BLACKLIST">Blacklist BED file.</ParamField>
+<ParamField path="tobias.params.motif_db" type="string" default="*MOTIF_DB">MEME motif database.</ParamField>
+<ParamField path="tobias.params.conditions" type="string" default="condition">
+  Column name from the sample sheet used to group samples for comparative BINDetect analysis.
+</ParamField>
+
+<ParamField path="tobias.threads" type="integer" default="8">CPU threads.</ParamField>
+<ParamField path="tobias.resources.mem_mb" type="integer" default="16000">Memory limit (MB).</ParamField>
+<ParamField path="tobias.resources.time" type="integer" default="240">Time limit (minutes).</ParamField>
+</Accordion>
+
+<Accordion title="footprinting">
+**Purpose:** HINT-ATAC footprinting via the RGT toolkit for detection of TF-bound regulatory elements.
+
+**Input:** `results/post_alignment/samtools_view/`
+
+**Outputs:**
+- Footprint BED: `results/peak_calling/footprinting/footprints/`
+- Plots: `results/peak_calling/footprinting/plots/`
+
+<ParamField path="footprinting.params.organism" type="string" default="hg38">
+  Organism genome assembly identifier (e.g., `hg38`, `mm10`).
+</ParamField>
+
+<ParamField path="footprinting.threads" type="integer" default="8">CPU threads.</ParamField>
+<ParamField path="footprinting.resources.mem_mb" type="integer" default="16000">Memory limit (MB).</ParamField>
+<ParamField path="footprinting.resources.time" type="integer" default="240">Time limit (minutes).</ParamField>
+</Accordion>
+
+<Accordion title="chromvar_analysis">
+**Purpose:** chromVAR motif accessibility deviation analysis - computes per-cell or per-sample TF activity scores from the shifted BAM.
+
+**Input:** `results/post_alignment/tn5_shift/`
+
+**Outputs:**
+- Deviation scores: `results/peak_calling/chromvar/deviations/`
+- Bias-corrected scores: `results/peak_calling/chromvar/bias_corrected/`
+- Plots: `results/peak_calling/chromvar/plots/`
+
+<ParamField path="chromvar_analysis.params.motif_db" type="string" default="*MOTIF_DB">MEME motif database.</ParamField>
+<ParamField path="chromvar_analysis.params.genome_fa" type="string" default="*GENOME_FA">Reference FASTA.</ParamField>
+<ParamField path="chromvar_analysis.params.genome_sizes" type="string" default="*GENOME_SIZES">Chromosome sizes file.</ParamField>
+
+<ParamField path="chromvar_analysis.threads" type="integer" default="8">CPU threads.</ParamField>
+<ParamField path="chromvar_analysis.resources.mem_mb" type="integer" default="16000">Memory limit (MB).</ParamField>
+<ParamField path="chromvar_analysis.resources.time" type="integer" default="240">Time limit (minutes).</ParamField>
+</Accordion>
+
+---
+
+## scATAC-seq - ArchR & Cicero
+
+<Accordion title="archr">
+**Purpose:** Single-cell ATAC-seq analysis using ArchR: Arrow file creation, doublet detection and filtering, iterative LSI dimensionality reduction, UMAP clustering, and marker gene identification.
+
+**Input:** `results/alignment/chromap/`
+
+**Outputs:**
+- Arrow files: `results/scatac/archr/arrow/`
+- Filtered Arrow files: `results/scatac/archr/filtered_arrow/`
+- Fragments: `results/scatac/archr/fragments/`
+- Clusters: `results/scatac/archr/clusters/`
+- Markers: `results/scatac/archr/markers/`
+- Doublets report: `results/scatac/archr/doublets/`
+- Plots: `results/scatac/archr/plots/`
+- QC report: `results/scatac/archr/qc_report/`
+
+<ParamField path="archr.params.min_tss" type="float" default="4.0">
+  Minimum TSS enrichment score for a cell barcode to be retained.
+</ParamField>
+
+<ParamField path="archr.params.min_frags" type="integer" default="1000">
+  Minimum fragment count per cell barcode.
+</ParamField>
+
+<ParamField path="archr.params.max_frags" type="integer" default="100000">
+  Maximum fragment count per cell barcode (doublet ceiling).
+</ParamField>
+
+<ParamField path="archr.params.tsse_method" type="string" default="ArchR">
+  TSS enrichment calculation method.
+</ParamField>
+
+<ParamField path="archr.params.doublet_threshold" type="float" default="0.2">
+  Doublet enrichment score cutoff for doublet removal.
+</ParamField>
+
+<ParamField path="archr.params.clustering_resolution" type="float" default="0.8">
+  Seurat-style Leiden clustering resolution. Higher values produce more clusters.
+</ParamField>
+
+<ParamField path="archr.params.dims_to_use" type="string" default="1:30">
+  LSI dimensions to use for UMAP embedding and clustering.
+</ParamField>
+
+<ParamField path="archr.params.force_dim_reduction" type="boolean" default="true">
+  Forces recalculation of dimensionality reduction even if cached results exist.
+</ParamField>
+
+<ParamField path="archr.threads" type="integer" default="16">CPU threads.</ParamField>
+<ParamField path="archr.resources.mem_mb" type="integer" default="64000">Memory limit (MB).</ParamField>
+<ParamField path="archr.resources.time" type="integer" default="240">Time limit (minutes).</ParamField>
+</Accordion>
+
+<Accordion title="cicero">
+**Purpose:** Chromatin co-accessibility analysis using Cicero: identifies co-accessible regulatory elements and calls Cis-Co-Accessibility Networks (CCANs).
+
+**Inputs:**
+- Filtered Arrow files: `results/scatac/archr/filtered_arrow/`
+- Cell clusters: `results/scatac/archr/clusters/`
+
+**Outputs:**
+- Co-accessibility connections: `results/scatac/cicero/connections/`
+- CCANs: `results/scatac/cicero/ccans/`
+- Plots: `results/scatac/cicero/plots/`
+
+<ParamField path="cicero.params.window_size" type="integer" default="500">
+  Window size in kb used to build KNN graphs for co-accessibility analysis.
+</ParamField>
+
+<ParamField path="cicero.params.distance_cutoff" type="integer" default="250000">
+  Maximum distance (bp) between co-accessible peaks to be included in a connection.
+</ParamField>
+
+<ParamField path="cicero.threads" type="integer" default="8">CPU threads.</ParamField>
+<ParamField path="cicero.resources.mem_mb" type="integer" default="32000">Memory limit (MB).</ParamField>
+<ParamField path="cicero.resources.time" type="integer" default="240">Time limit (minutes).</ParamField>
+</Accordion>
+
+---
+
+## Reporting
+
+<Accordion title="benchmark_summary">
+**Purpose:** Aggregates per-rule Snakemake benchmark files into a single TSV summary of wall-clock time, CPU time, and peak memory usage across all pipeline stages.
+
+**Output:** `results/reporting/benchmark_summary.tsv`
+</Accordion>
+
+<Accordion title="multiqc">
+**Purpose:** Aggregates QC metrics from fastp, FastQC, Picard, samtools, preseq, Qualimap, and the QC gate into a single interactive HTML report.
+
+**Output:** `results/reporting/multiqc/`
+
+<ParamField path="multiqc.params.config" type="string" default="rules/config/multiqc_config.yaml">
+  Path to the MultiQC configuration YAML file for custom module settings and report branding.
+</ParamField>
+
+<ParamField path="multiqc.threads" type="integer" default="2">CPU threads.</ParamField>
+<ParamField path="multiqc.resources.mem_mb" type="integer" default="4000">Memory limit (MB).</ParamField>
+<ParamField path="multiqc.resources.time" type="integer" default="30">Time limit (minutes).</ParamField>
+</Accordion>

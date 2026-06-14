@@ -1,0 +1,175 @@
+---
+title: "ATAC-seq Preprocessing: fastp Trimming & FastQC"
+sidebarTitle: "Preprocessing"
+description: "How the pipeline trims adapters and 5′ Tn5 bias with fastp, then runs FastQC quality reports on every trimmed FASTQ pair."
+---
+
+Raw ATAC-seq paired-end reads carry two sources of contamination that must be removed before alignment: residual Nextera adapter sequences introduced during library preparation, and the well-characterized Tn5 insertion bias at the extreme 5′ end of each read. The pipeline handles both in a single `fastp` pass per sample, then immediately feeds the trimmed FASTQs into `FastQC` to produce per-base-quality and adapter-content reports. Both steps are fully parallelized and containerized, and every output path is resolved from `config.yaml` so no rule file ever needs editing.
+
+## Why 5′ Bases Are Trimmed in ATAC-seq
+
+During ATAC-seq library construction, the hyperactive Tn5 transposase cuts accessible chromatin and simultaneously ligates sequencing adapters. The nucleotides at the very 5′ end of each read are therefore directly adjacent to the Tn5 insertion site, and their base composition is dominated by the enzyme's own sequence preference rather than by the underlying genomic sequence. Retaining these bases introduces a systematic GC and sequence bias that inflates false-positive peak calls near Tn5-preferred motifs. Trimming five bases from the 5′ end of both R1 (`trim_front1: 5`) and R2 (`trim_front2: 5`) removes this bias at its source before any reads are aligned.
+
+## Configuration
+
+```yaml
+# config.yaml
+fastp:
+  output: "results/preprocessing/fastp"
+  params:
+    trim_front1: 5       # bases trimmed from R1 5′ end (Tn5 bias)
+    trim_front2: 5       # bases trimmed from R2 5′ end (Tn5 bias)
+    length_required: 30  # discard reads shorter than 30 bp after trimming
+  threads: 4
+  resources:
+    mem_mb: 8000
+    time: 120
+
+fastqc:
+  input:
+    R1: "results/preprocessing/fastp"
+    R2: "results/preprocessing/fastp"
+  output: "results/preprocessing/fastqc"
+  threads: 4
+  resources:
+    mem_mb: 2000
+    time: 30
+```
+
+<Note>
+  Raw FASTQ paths are **not** declared under `fastp.input` in `config.yaml`. They are resolved dynamically at runtime from the sample sheet (`global.samples`), so the config stays sample-agnostic.
+</Note>
+
+## fastp Trimming
+
+<Steps>
+  <Step title="Adapter Detection">
+    fastp automatically detects Nextera/Illumina adapter sequences in paired-end mode (`--detect_adapter_for_pe`). No adapter sequence needs to be provided manually.
+  </Step>
+  <Step title="5′ Bias Removal">
+    Five bases are hard-clipped from the 5′ end of R1 (`--trim_front1 5`) and R2 (`--trim_front2 5`) to eliminate Tn5 insertion-site bias before alignment.
+  </Step>
+  <Step title="Length Filtering">
+    Any read shorter than 30 bp after trimming is discarded (`--length_required 30`). This prevents very short fragments — which align ambiguously — from polluting the BAM.
+  </Step>
+  <Step title="Report Generation">
+    fastp writes a per-sample HTML report and a machine-readable JSON summary. The JSON is later consumed by MultiQC.
+  </Step>
+</Steps>
+
+### Snakemake Rule
+
+```python
+# rules/fastp.smk
+rule fastp_trim:
+    input:
+        R1 = lambda wildcards: FASTQ_R1[wildcards.sample],
+        R2 = lambda wildcards: FASTQ_R2[wildcards.sample]
+    output:
+        R1_trimmed = f"{config['fastp']['output']}/{sample}_R1_trimmed.fastq.gz",
+        R2_trimmed = f"{config['fastp']['output']}/{sample}_R2_trimmed.fastq.gz",
+        html       = f"{config['fastp']['output']}/{sample}.html",
+        json       = f"{config['fastp']['output']}/{sample}.json"
+    params:
+        trim_front1      = config["fastp"]["params"]["trim_front1"],
+        trim_front2      = config["fastp"]["params"]["trim_front2"],
+        length_required  = config["fastp"]["params"]["length_required"]
+    threads: config["fastp"]["threads"]   # 4
+    shell:
+        """
+        fastp \
+          -i {input.R1} \
+          -I {input.R2} \
+          -o {output.R1_trimmed} \
+          -O {output.R2_trimmed} \
+          --detect_adapter_for_pe \
+          --trim_front1 {params.trim_front1} \
+          --trim_front2 {params.trim_front2} \
+          --length_required {params.length_required} \
+          --thread {threads} \
+          --html {output.html} \
+          --json {output.json} \
+          > {log} 2>&1
+        """
+```
+
+### Output Files
+
+| File | Description |
+|---|---|
+| `{sample}_R1_trimmed.fastq.gz` | Trimmed R1 reads; input to Bowtie2 |
+| `{sample}_R2_trimmed.fastq.gz` | Trimmed R2 reads; input to Bowtie2 |
+| `{sample}.html` | Interactive fastp quality report |
+| `{sample}.json` | Machine-readable summary for MultiQC |
+
+All outputs land in `results/preprocessing/fastp/`.
+
+## FastQC Quality Reports
+
+FastQC runs immediately after fastp and takes the **trimmed** FASTQs as input — not the raw reads. This means the reports reflect the actual data that will be aligned, giving accurate adapter-content and per-base-quality statistics.
+
+```python
+# rules/fastqc.smk
+rule fastqc:
+    input:
+        R1_trimmed = f"{config['fastqc']['input']['R1']}/{sample}_R1_trimmed.fastq.gz",
+        R2_trimmed = f"{config['fastqc']['input']['R2']}/{sample}_R2_trimmed.fastq.gz"
+    output:
+        R1_report = f"{config['fastqc']['output']}/{sample}_R1_trimmed_fastqc.html",
+        R1_zip    = f"{config['fastqc']['output']}/{sample}_R1_trimmed_fastqc.zip",
+        R2_report = f"{config['fastqc']['output']}/{sample}_R2_trimmed_fastqc.html",
+        R2_zip    = f"{config['fastqc']['output']}/{sample}_R2_trimmed_fastqc.zip"
+    threads: config["fastqc"]["threads"]   # 4
+    shell:
+        """
+        fastqc -t {threads} -o {params.out_dir} \
+            {input.R1_trimmed} {input.R2_trimmed} 2> {log}
+        """
+```
+
+### Output Files
+
+| File | Description |
+|---|---|
+| `{sample}_R1_trimmed_fastqc.html` | R1 interactive quality report |
+| `{sample}_R1_trimmed_fastqc.zip` | R1 data archive consumed by MultiQC |
+| `{sample}_R2_trimmed_fastqc.html` | R2 interactive quality report |
+| `{sample}_R2_trimmed_fastqc.zip` | R2 data archive consumed by MultiQC |
+
+All outputs land in `results/preprocessing/fastqc/`.
+
+<Tip>
+  The `.zip` archives from FastQC are automatically picked up by the `multiqc` rule. No path configuration is required — MultiQC scans the directories passed to it and discovers them by file extension.
+</Tip>
+
+## Resource Scaling
+
+Both rules use adaptive memory allocation: if the input FASTQ is larger than the config floor, the rule requests 1.5× the input size in RAM. On retry (Snakemake's `attempt` variable), both memory and wall-time scale linearly.
+
+```python
+resources:
+    mem_mb = lambda wildcards, input, attempt:
+        max(config['fastp']['resources']['mem_mb'],
+            int(input.size_mb * 1.5)) * attempt,
+    time   = lambda wildcards, attempt:
+        config['fastp']['resources']['time'] * attempt
+```
+
+<Warning>
+  If you are processing very large FASTQ files (> 20 GB per sample), consider switching to the `low_resource` profile and enabling sequential batching via `rules/scripts/run_batched.py` to avoid OOM errors on memory-constrained systems.
+</Warning>
+
+## Container Support
+
+Both rules ship with both Conda environment definitions **and** Singularity container URIs:
+
+<CodeGroup>
+```text fastp Container
+https://depot.galaxyproject.org/singularity/fastp:0.24.0--heae3180_1
+```
+```text FastQC Container
+https://depot.galaxyproject.org/singularity/fastqc:0.11.9--0
+```
+</CodeGroup>
+
+Pass `--use-singularity` to Snakemake instead of `--use-conda` to run entirely inside containers — no local tool installation required.

@@ -1,0 +1,414 @@
+---
+title: "Cloud Deployment: AWS, GCP, Azure, and Kubernetes"
+sidebarTitle: "Cloud"
+description: "Deploy the BDB-Genomics ATAC-seq pipeline to AWS Batch, Google Life Sciences, Azure Batch, or Kubernetes using pre-built Snakemake executor profiles."
+---
+
+The BDB-Genomics ATAC-seq pipeline ships four cloud-ready Snakemake profiles that map rule execution to managed compute services on AWS, GCP, Azure, and Kubernetes. Each profile installs the appropriate Snakemake executor plugin, routes intermediate files through cloud object storage, and allows Snakemake's per-rule resource blocks to drive instance selection automatically. All profiles share the same `config.yaml` and sample sheet format as local or SLURM execution — switching targets is a single `--profile` flag change.
+
+<Warning>
+Cloud execution incurs real costs. Review your provider's pricing before submitting large runs. Always delete compute resources and object storage after the pipeline completes to stop accruing charges.
+</Warning>
+
+---
+
+## AWS Batch + Tibanna
+
+The AWS profile routes jobs through [Tibanna](https://tibanna.readthedocs.io/), a serverless workflow manager that translates Snakemake resource requests into AWS Batch job definitions and submits them to the appropriate EC2 instance types.
+
+### Profile
+
+```yaml
+# profile/aws/config.yaml
+
+executor: tibanna
+use-conda: true
+use-singularity: true
+jobs: 50
+printshellcmds: true
+show-failed-logs: true
+keep-going: true
+rerun-incomplete: true
+restart-times: 1
+
+latency-wait: 120
+
+default-resources:
+  mem_mb: 4000
+  time: 60
+  threads: 1
+
+# Tibanna settings (replace with your values)
+tibanna-sfn: "tibanna_unicorn_atacseq"
+default-remote-prefix: "YOUR_S3_BUCKET/atacseq-pipeline"
+default-remote-provider: "S3"
+```
+
+### Prerequisites
+
+<Steps>
+
+### Install the executor plugin and Tibanna
+
+```bash
+pip install snakemake-executor-plugin-tibanna
+pip install tibanna
+```
+
+### Configure AWS credentials
+
+```bash
+aws configure
+# Enter: AWS_ACCESS_KEY_ID, AWS_SECRET_ACCESS_KEY, region, output format
+```
+
+Alternatively, set environment variables directly:
+
+```bash
+export AWS_ACCESS_KEY_ID=your_key_id
+export AWS_SECRET_ACCESS_KEY=your_secret_key
+```
+
+### Create an S3 bucket for intermediate storage
+
+```bash
+aws s3 mb s3://your-bucket-name
+```
+
+### Deploy the Tibanna unicorn (one-time setup per AWS account)
+
+```bash
+tibanna deploy_unicorn -g atacseq -b your-bucket-name
+```
+
+### Update the profile with your bucket name
+
+Edit `profile/aws/config.yaml` and replace `YOUR_S3_BUCKET` with the bucket you created:
+
+```yaml
+tibanna-sfn: "tibanna_unicorn_atacseq"
+default-remote-prefix: "your-bucket-name/atacseq-pipeline"
+default-remote-provider: "S3"
+```
+
+</Steps>
+
+### Running on AWS
+
+```bash
+snakemake --profile profile/aws
+```
+
+For scATAC mode:
+
+```bash
+ATAC_MODE=scatac snakemake --profile profile/aws
+```
+
+---
+
+## Google Cloud Life Sciences
+
+The GCP profile uses the [Google Life Sciences API](https://cloud.google.com/life-sciences) (formerly Pipelines API) executor to run each Snakemake rule as a containerised virtual machine job on Google Compute Engine.
+
+### Profile
+
+```yaml
+# profile/gcp/config.yaml
+
+executor: google-lifesciences
+use-conda: true
+use-singularity: true
+jobs: 50
+printshellcmds: true
+show-failed-logs: true
+keep-going: true
+rerun-incomplete: true
+restart-times: 1
+
+latency-wait: 120
+
+default-resources:
+  mem_mb: 4000
+  time: 60
+  threads: 1
+  machine_type: "n1-standard-4"
+
+# Google Cloud settings (replace with your values)
+google-lifesciences-project: "YOUR_GCP_PROJECT_ID"
+google-lifesciences-region: "us-central1"
+default-remote-prefix: "YOUR_GCS_BUCKET/atacseq-pipeline"
+default-remote-provider: "GS"
+```
+
+### Prerequisites
+
+<Steps>
+
+### Install the executor plugin
+
+```bash
+pip install snakemake-executor-plugin-google-lifesciences
+```
+
+### Authenticate with Google Cloud
+
+```bash
+gcloud auth application-default login
+```
+
+### Create a GCS bucket for intermediate storage
+
+```bash
+gsutil mb gs://your-bucket-name
+```
+
+### Update the profile with your project and bucket
+
+Edit `profile/gcp/config.yaml` and replace the placeholder values:
+
+```yaml
+google-lifesciences-project: "my-gcp-project-id"
+google-lifesciences-region: "us-central1"
+default-remote-prefix: "your-bucket-name/atacseq-pipeline"
+default-remote-provider: "GS"
+```
+
+</Steps>
+
+### Running on GCP
+
+```bash
+snakemake --profile profile/gcp
+```
+
+<Note>
+New Google Cloud accounts receive $300 of free credit valid for 90 days. The always-free tier includes one `f1-micro` instance but this is insufficient for ATAC-seq alignment. Use the free credit for initial testing, then upgrade to a paid account for production runs.
+</Note>
+
+---
+
+## Azure Batch
+
+The Azure profile submits Snakemake rules as Azure Batch tasks backed by a managed pool of virtual machines. Intermediate files are stored in Azure Blob Storage.
+
+### Profile
+
+```yaml
+# profile/azure/config.yaml
+
+executor: azure-batch
+use-conda: true
+use-singularity: true
+jobs: 50
+printshellcmds: true
+show-failed-logs: true
+keep-going: true
+rerun-incomplete: true
+restart-times: 1
+
+latency-wait: 120
+
+default-resources:
+  mem_mb: 4000
+  time: 60
+  threads: 1
+
+# Azure Batch settings (replace with your values)
+az-batch-account-url: "https://YOUR_BATCH_ACCOUNT.eastus.batch.azure.com"
+default-remote-prefix: "YOUR_BLOB_CONTAINER/atacseq-pipeline"
+default-remote-provider: "AzBlob"
+```
+
+### Prerequisites
+
+<Steps>
+
+### Install the executor plugin
+
+```bash
+pip install snakemake-executor-plugin-azure-batch
+```
+
+### Authenticate with Azure
+
+```bash
+az login
+```
+
+### Create a Batch account and a storage account
+
+```bash
+az batch account create \
+  --name atacseqbatch \
+  --resource-group YOUR_RG \
+  --location eastus
+
+az storage account create \
+  --name atacseqstorage \
+  --resource-group YOUR_RG \
+  --location eastus
+```
+
+### Create a Blob container for intermediate storage
+
+```bash
+az storage container create \
+  --name atacseq-pipeline \
+  --account-name atacseqstorage
+```
+
+### Update the profile with your account details
+
+Edit `profile/azure/config.yaml` and replace the placeholder values:
+
+```yaml
+az-batch-account-url: "https://atacseqbatch.eastus.batch.azure.com"
+default-remote-prefix: "atacseq-pipeline/atacseq-pipeline"
+default-remote-provider: "AzBlob"
+```
+
+</Steps>
+
+### Running on Azure
+
+```bash
+snakemake --profile profile/azure
+```
+
+<Note>
+Azure offers $200 of free credit for new accounts (30-day validity). Delete Batch pools and storage containers after the run to avoid ongoing charges.
+</Note>
+
+---
+
+## Kubernetes
+
+The Kubernetes profile uses the [Snakemake Kubernetes executor plugin](https://github.com/snakemake/snakemake-executor-plugin-kubernetes) to schedule each Snakemake rule as a Kubernetes Pod. This profile works with any Kubernetes distribution — GKE, EKS, AKS, or a local Minikube cluster.
+
+### Profile
+
+```yaml
+# profile/kubernetes/config.yaml
+
+executor: kubernetes
+use-conda: true
+use-singularity: true
+jobs: 50
+printshellcmds: true
+show-failed-logs: true
+keep-going: true
+rerun-incomplete: true
+restart-times: 1
+
+latency-wait: 120
+
+default-resources:
+  mem_mb: 4000
+  time: 60
+  threads: 1
+
+# Kubernetes settings (replace with your values)
+kubernetes-namespace: "default"
+default-remote-prefix: "YOUR_BUCKET/atacseq-pipeline"
+default-remote-provider: "GS"       # or "S3" for AWS, "AzBlob" for Azure
+```
+
+### Prerequisites
+
+<Steps>
+
+### Install the executor plugin
+
+```bash
+pip install snakemake-executor-plugin-kubernetes
+```
+
+### Create or connect to a Kubernetes cluster
+
+<Tabs>
+  <Tab title="GKE (Google)">
+    ```bash
+    gcloud container clusters create atacseq-cluster --num-nodes=2
+    ```
+  </Tab>
+  <Tab title="EKS (AWS)">
+    ```bash
+    eksctl create cluster --name atacseq-cluster --nodes=2
+    ```
+  </Tab>
+  <Tab title="Minikube (local)">
+    ```bash
+    minikube start --memory=8192 --cpus=4
+    ```
+  </Tab>
+</Tabs>
+
+### Verify kubectl context
+
+```bash
+kubectl config current-context
+```
+
+### Create a cloud storage bucket and update the profile
+
+The Kubernetes executor uses cloud object storage for intermediate files. Set `default-remote-prefix` and `default-remote-provider` to match your provider:
+
+```yaml
+# For GCS:
+default-remote-prefix: "your-bucket/atacseq-pipeline"
+default-remote-provider: "GS"
+
+# For S3:
+default-remote-prefix: "your-bucket/atacseq-pipeline"
+default-remote-provider: "S3"
+
+# For Azure Blob:
+default-remote-prefix: "your-container/atacseq-pipeline"
+default-remote-provider: "AzBlob"
+```
+
+</Steps>
+
+### Running on Kubernetes
+
+```bash
+snakemake --profile profile/kubernetes
+```
+
+<Warning>
+Always delete the cluster after the pipeline completes to stop VM billing:
+```bash
+# GKE
+gcloud container clusters delete atacseq-cluster
+
+# EKS
+eksctl delete cluster --name atacseq-cluster
+```
+</Warning>
+
+---
+
+## Cloud Profile Comparison
+
+| Profile | Executor Plugin | Storage | Typical Use Case |
+|---|---|---|---|
+| `profile/aws` | `snakemake-executor-plugin-tibanna` | S3 | Serverless AWS, pay-per-invocation |
+| `profile/gcp` | `snakemake-executor-plugin-google-lifesciences` | GCS | GCP-native managed VMs |
+| `profile/azure` | `snakemake-executor-plugin-azure-batch` | Azure Blob | Azure-native batch pools |
+| `profile/kubernetes` | `snakemake-executor-plugin-kubernetes` | Any (GS/S3/AzBlob) | Multi-cloud or on-premises K8s |
+
+---
+
+## Dynamic Resource Scaling
+
+All cloud profiles use `default-resources` as fallback values only. The per-rule resource lambdas defined in the Snakemake rules scale memory with input file size and multiply resources on retry:
+
+```python
+# Example from chromap.smk
+resources:
+    mem_mb=lambda wildcards, input, attempt: max(config['chromap']['resources']['mem_mb'], int(input.size_mb * 1.5)) * attempt,
+    time=lambda wildcards, attempt: config['chromap']['resources']['time'] * attempt,
+```
+
+This means a rule that requires 32 GB on the first attempt automatically requests 64 GB if it is retried — without any manual intervention.

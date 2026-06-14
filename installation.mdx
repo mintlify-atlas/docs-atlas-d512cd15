@@ -1,0 +1,223 @@
+---
+title: "BDB-Genomics ATAC-seq Pipeline: Installation"
+sidebarTitle: "Installation"
+description: "Install the BDB-Genomics ATAC-seq pipeline via Conda, Docker, or Singularity/Apptainer — with full system requirements and per-rule dependency resolution."
+---
+
+The BDB-Genomics ATAC-seq Framework is designed to be installed and running with minimal manual dependency management. All per-rule bioinformatics tools (Bowtie2, MACS2, TOBIAS, ArchR, DESeq2, and 40+ others) are declared in individual Conda environment files under `rules/envs/` and are resolved automatically by Snakemake at runtime. Your host environment only needs to satisfy a small set of requirements. Choose the installation method that best matches your platform and workflow.
+
+## System Requirements
+
+Before choosing an installation method, confirm your system meets these baseline requirements:
+
+| Requirement | Minimum Version | Notes |
+|---|---|---|
+| **Snakemake** | ≥ 8.0 | Required for executor plugin support and improved caching |
+| **Python** | ≥ 3.9 | Required by validation and helper scripts |
+| **Conda or Mamba** | Any recent release | Required for `--use-conda` per-rule environment resolution |
+| **RAM** | 4 GB | Use `profile/low_resource` on constrained machines |
+| **OS** | Linux (recommended) | macOS and Windows users should use the Docker method |
+
+<Warning>
+  macOS and Windows users are strongly encouraged to use the **Docker installation method** below. The pipeline's Singularity container directives and some bioinformatics tools have known compatibility issues on non-Linux hosts. The Docker image provides a fully Linux-native execution environment on any platform.
+</Warning>
+
+## Installation Methods
+
+<Tabs>
+  <Tab title="Conda (Primary)">
+    Conda is the recommended installation path for Linux workstations and HPC clusters. The host environment requires only Snakemake; all downstream tool dependencies are resolved automatically.
+
+    ### Step 1: Create the host environment
+
+    ```bash
+    conda create -n atacseq snakemake>=8.0 -c conda-forge -c bioconda
+    conda activate atacseq
+    ```
+
+    <Tip>
+      If you have Mamba installed, substitute `mamba create` for significantly faster dependency resolution — the environment specification is identical.
+    </Tip>
+
+    ### Step 2: Clone the repository
+
+    ```bash
+    git clone https://github.com/BDB-Genomics/atacseq-pipeline.git
+    cd atacseq-pipeline
+    ```
+
+    ### Step 3: Run with per-rule Conda environments
+
+    Pass `--use-conda` to instruct Snakemake to build and cache each rule's individual environment automatically:
+
+    ```bash
+    snakemake --use-conda --cores 8
+    ```
+
+    On first run, Snakemake will download and create all required environments. Subsequent runs reuse the cached environments from `.snakemake/conda/`.
+
+    <Note>
+      The `envs/main.yaml` file defines the host runner environment used in the Docker image. For local Conda installs you only need the `conda create` command above — `main.yaml` is not required on the host.
+    </Note>
+  </Tab>
+
+  <Tab title="Docker">
+    Docker is the recommended method for macOS and Windows users, or for any environment where Conda and Singularity are difficult to install. The provided `Dockerfile` builds a host runner image using **micromamba** with Snakemake pre-installed. Individual rule dependencies are still resolved dynamically by Snakemake inside the container at runtime.
+
+    ### Step 1: Build the host runner image
+
+    From the repository root, build the image:
+
+    ```bash
+    docker build -t bdb-atacseq .
+    ```
+
+    The `Dockerfile` is structured in three cached layers:
+    1. **Base image** — `mambaorg/micromamba:1.5-bullseye-slim`
+    2. **Environment layer** — installs Snakemake and Python from `envs/main.yaml` via micromamba
+    3. **Code layer** — copies the pipeline source into `/app`
+
+    Because the environment layer is cached independently of the code layer, rebuilding after a code change is fast and does not re-download tool dependencies.
+
+    ### Step 2: Run the pipeline
+
+    Mount your working directory and the Docker socket into the container. The image's `ENTRYPOINT` is `snakemake`, so all arguments are passed directly:
+
+    ```bash
+    docker run -it --rm \
+      -v $(pwd):/app \
+      -v /var/run/docker.sock:/var/run/docker.sock \
+      bdb-atacseq --use-conda --cores 8
+    ```
+
+    To run single-cell mode, pass the environment variable via `docker run -e`:
+
+    ```bash
+    docker run -it --rm \
+      -v $(pwd):/app \
+      -v /var/run/docker.sock:/var/run/docker.sock \
+      -e ATAC_MODE=scatac \
+      bdb-atacseq --use-conda --cores 8
+    ```
+
+    <Note>
+      Mounting `/var/run/docker.sock` enables Docker-in-Docker, allowing Snakemake to spin up per-rule tool containers from inside the host runner when container directives are used. This is required if you intend to use Singularity/Apptainer-style container execution within Docker.
+    </Note>
+
+    <Tip>
+      Pass `--help` as the command argument to see all available Snakemake flags without executing a run:
+
+      ```bash
+      docker run --rm bdb-atacseq --help
+      ```
+    </Tip>
+  </Tab>
+
+  <Tab title="Per-Rule Conda Envs">
+    Every Snakemake rule in the pipeline declares its own isolated Conda environment via an `envs:` directive pointing to a YAML file in `rules/envs/`. This means you never need to install Bowtie2, MACS2, TOBIAS, samtools, or any other bioinformatics tool into your host environment.
+
+    ### How it works
+
+    When you run `snakemake --use-conda`, Snakemake reads each rule's environment file and:
+
+    1. Computes a hash of the environment specification.
+    2. Checks `.snakemake/conda/` for a cached environment matching that hash.
+    3. Creates and activates the environment if it does not exist, or reuses it if it does.
+
+    Each rule runs inside its own isolated environment, preventing dependency conflicts between tools — for example, rules using Python 2-era tools run in a separate environment from rules that require Python ≥ 3.9.
+
+    ### Environment files
+
+    The per-rule environment files live at `rules/envs/` and follow the standard Conda YAML format. You can inspect or modify them to pin specific tool versions:
+
+    ```yaml
+    # Example: rules/envs/bowtie2.yaml (illustrative)
+    channels:
+      - conda-forge
+      - bioconda
+    dependencies:
+      - bowtie2
+      - samtools
+    ```
+
+    <Note>
+      You do not need to create or activate these environments manually. Snakemake manages them entirely. Simply always pass `--use-conda` when running the pipeline.
+    </Note>
+
+    ### Pre-warming environments
+
+    On clusters where compute nodes lack internet access, you can pre-warm all environments on a login node before submitting jobs:
+
+    ```bash
+    snakemake --use-conda --conda-create-envs-only --cores 1
+    ```
+
+    This creates every environment without running any rules, so subsequent cluster jobs can activate them from the cache without requiring network access.
+  </Tab>
+
+  <Tab title="Singularity / Apptainer">
+    Selected rules in the pipeline include `container:` directives that pull pre-built images from the **Galaxy Project Biocontainers** registry. When Snakemake is invoked with `--use-singularity` (or `--use-apptainer` for Apptainer), these rules execute inside their declared containers rather than a locally created Conda environment.
+
+    ### Running with Singularity
+
+    ```bash
+    snakemake --use-singularity --use-conda --cores 8
+    ```
+
+    Combining `--use-singularity` with `--use-conda` is the recommended invocation: rules that declare a `container:` directive use Singularity, and all other rules fall back to their per-rule Conda environment.
+
+    ### Running with Apptainer
+
+    On systems where Apptainer is the installed runtime (common on modern HPC clusters), use `--use-apptainer` instead:
+
+    ```bash
+    snakemake --use-apptainer --use-conda --cores 8
+    ```
+
+    <Note>
+      Container images are cached in `.snakemake/singularity/` on first use. On HPC clusters with shared filesystems, point this cache to a shared location using `--singularity-prefix /shared/cache/path` to avoid redundant downloads across users.
+    </Note>
+
+    <Warning>
+      Singularity and Apptainer require kernel-level support (user namespaces or setuid installation). Confirm with your system administrator that one of these is available before relying on container directives. On systems without Singularity/Apptainer, use the Conda-only or Docker methods instead.
+    </Warning>
+  </Tab>
+</Tabs>
+
+## Verifying Your Installation
+
+After completing any of the installation methods above, verify the setup by running the config validation script and a dry-run:
+
+```bash
+# Confirm the config is valid
+python3 rules/scripts/validate_config.py config.yaml
+
+# Dry-run: print the execution plan without running any jobs
+snakemake --use-conda --cores 8 --dry-run
+```
+
+A successful dry-run prints the full list of jobs Snakemake plans to execute, ending with a `Nothing to be done` or job count summary. If the dry-run reports errors, review the validation output for missing reference files or misconfigured paths.
+
+<Accordion title="Troubleshooting common installation issues">
+
+**`snakemake: command not found` after `conda activate atacseq`**
+
+Ensure you have activated the correct environment. Run `conda env list` to confirm `atacseq` appears, then re-run `conda activate atacseq`.
+
+**`No samples found in sample sheet`**
+
+The `global.samples` key in `config.yaml` points to a file that does not exist or is empty. Run `python3 rules/scripts/generate_test_data.py` to create synthetic data and a valid sample sheet, or update the path to point at your own `samples.tsv`.
+
+**`docker: permission denied while trying to connect to the Docker daemon`**
+
+Add your user to the `docker` group (`sudo usermod -aG docker $USER`) and log out and back in, or prefix Docker commands with `sudo`.
+
+**Singularity pull fails on HPC with `quota exceeded`**
+
+Use `--singularity-prefix` to redirect the image cache to a scratch filesystem with more available space:
+
+```bash
+snakemake --use-singularity --singularity-prefix /scratch/$USER/singularity_cache --cores 8
+```
+
+</Accordion>

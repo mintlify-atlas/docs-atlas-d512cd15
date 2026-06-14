@@ -1,0 +1,205 @@
+---
+title: "run_batched.py: Sequential Sample Batching CLI Reference"
+sidebarTitle: "run-batched"
+description: "CLI reference for run_batched.py — splits the sample list into sequential Snakemake batches to cap peak memory usage on machines with 4 GB RAM or fewer."
+---
+
+`run_batched.py` is a memory-efficiency wrapper for the BDB-Genomics ATAC-seq pipeline designed for machines where running all samples concurrently would exhaust available RAM. Instead of letting Snakemake schedule all samples in parallel, this script reads the sample sheet, divides the samples into sequential batches of a fixed size, and invokes Snakemake once per batch — each batch targeting a specific set of final output files for just those samples. Because each Snakemake invocation finishes completely before the next begins, peak memory usage is bounded by a single batch rather than the full sample set. After all batches complete, the script runs a final Snakemake invocation to generate the MultiQC aggregation report.
+
+```bash
+python3 rules/scripts/run_batched.py --batch-size 2 --cores 4 --memory 8000
+```
+
+---
+
+## Arguments
+
+<ParamField path="--batch-size" type="integer" default="1">
+  Number of samples to include in each sequential Snakemake batch. A batch size of `1` runs one sample at a time (minimum memory footprint). A batch size of `2` runs two samples concurrently within each batch invocation.
+
+  **Recommended values:**
+  - ≤ 4 GB RAM: `--batch-size 1`
+  - 4–8 GB RAM: `--batch-size 2`
+  - 8–16 GB RAM: `--batch-size 4`
+</ParamField>
+
+<ParamField path="--cores" type="integer" default="2">
+  Number of CPU cores passed to each `snakemake --cores` invocation. Applies to every batch and to the final MultiQC aggregation run.
+</ParamField>
+
+<ParamField path="--memory" type="integer" default="4000">
+  Memory limit in megabytes passed to each Snakemake invocation via `--resources mem_mb={memory}`. Snakemake uses this to prevent scheduling rules whose `resources.mem_mb` would exceed the limit.
+</ParamField>
+
+<ParamField path="--mode" type="string" default="null">
+  Pipeline modality: `"bulk"` or `"scatac"`. When not set, the script reads from the `ATAC_MODE` environment variable, then falls back to `global.mode` in `config.yaml`. Must be `"bulk"` or `"scatac"`; any other value causes the script to exit with an error.
+</ParamField>
+
+<ParamField path="--config" type="string" default="config.yaml">
+  Path to the pipeline configuration YAML file, relative to the pipeline root. The script loads this file to resolve output paths for each tool when constructing per-batch target file lists.
+</ParamField>
+
+<ParamField path="--sample-sheet" type="string" default="data/fastp/samples.tsv">
+  Path to the TSV sample sheet, relative to the pipeline root. The script reads the `sample` column to produce the ordered list of sample names that is then divided into batches.
+</ParamField>
+
+<ParamField path="--conda-frontend" type="string" default="mamba">
+  Conda frontend passed to Snakemake via `--conda-frontend`. Accepted values: `"conda"` or `"mamba"`.
+</ParamField>
+
+<ParamField path="--dry-run" type="boolean" default="false">
+  When supplied, prints the batch plan (which samples are in each batch and how many batches total) without executing any Snakemake commands. Useful for verifying batch assignments before committing to a long run.
+</ParamField>
+
+<ParamField path="extra_args" type="string[]" default="[]">
+  Any additional arguments listed after all named arguments are passed verbatim to every Snakemake invocation (including the final MultiQC aggregation step). For example: `-- --forcerun tn5_shift`.
+</ParamField>
+
+---
+
+## How It Works
+
+<Steps>
+  <Step title="Load configuration">
+    Reads the base `config.yaml` from the pipeline root. If `--config` points to a different file, that file is deep-merged on top of the base config so custom overrides take effect while all tool output paths remain fully resolved.
+  </Step>
+
+  <Step title="Read sample sheet">
+    Opens the TSV sample sheet and extracts all values from the `sample` column, preserving their order.
+  </Step>
+
+  <Step title="Split into batches">
+    Divides the ordered sample list into consecutive groups of `--batch-size`. The last batch may have fewer samples than the others.
+
+    ```
+    Samples: [A, B, C, D, E]  |  batch-size: 2
+    Batch 1: [A, B]
+    Batch 2: [C, D]
+    Batch 3: [E]
+    ```
+  </Step>
+
+  <Step title="Run each batch sequentially">
+    For each batch, constructs a list of concrete target files from the config's output paths and calls Snakemake with:
+
+    ```bash
+    snakemake \
+      --use-conda \
+      --conda-frontend mamba \
+      --cores 4 \
+      --resources mem_mb=8000 \
+      --profile profile/low_resource \
+      --rerun-incomplete \
+      --keep-going \
+      <target_files_for_this_batch>
+    ```
+
+    The `ATAC_MODE` environment variable is set to the resolved `mode` value for each invocation.
+  </Step>
+
+  <Step title="Track failures">
+    Batches that exit with a non-zero Snakemake return code are recorded in a `failed_batches` list. The script continues to the next batch regardless (`--keep-going` behaviour). A summary of failed batches is printed at the end.
+  </Step>
+
+  <Step title="Final MultiQC aggregation">
+    After all batches complete, runs one final Snakemake command targeting only the MultiQC report:
+
+    ```bash
+    snakemake \
+      --use-conda \
+      --conda-frontend mamba \
+      --cores 1 \
+      --profile profile/low_resource \
+      results/reporting/multiqc/multiqc_report.html
+    ```
+  </Step>
+</Steps>
+
+---
+
+## Per-Batch Target Files
+
+### Bulk mode (`global.mode: "bulk"`)
+
+For each sample in the batch, the following target files are requested from Snakemake:
+
+| File | Source config key |
+|---|---|
+| `{fastp.output}/{sample}_R1_trimmed.fastq.gz` | `fastp.output` |
+| `{bowtie2.output}/{sample}.bam` | `bowtie2.output` |
+| `{samtools_sort.output.sorted_bam}/{sample}.sorted.bam` | `samtools_sort.output.sorted_bam` |
+| `{samtools_markdup.output.markdup_bam}/{sample}.sorted.dedup.bam` | `samtools_markdup.output.markdup_bam` |
+| `{tn5_shift.output.shifted_bam}/{sample}.filtered.shifted.bam` | `tn5_shift.output.shifted_bam` |
+| `{macs2.output.peaks}/{sample}_peaks.narrowPeak` | `macs2.output.peaks` |
+| `{blacklist_filter.output.filtered_peaks}/{sample}_filtered_peaks.bed` | `blacklist_filter.output.filtered_peaks` |
+| `{qc_gate.output}/{sample}_qc_pass.txt` | `qc_gate.output` |
+| `{bigwig.output.bigwig}/{sample}.bw` | `bigwig.output.bigwig` |
+
+### scATAC-seq mode (`global.mode: "scatac"`)
+
+| File | Source config key |
+|---|---|
+| `{fastp.output}/{sample}_R1_trimmed.fastq.gz` | `fastp.output` |
+| `{chromap.output}/{sample}.bam` | `chromap.output` |
+| `{bigwig.output.bigwig}/{sample}.bw` | `bigwig.output.bigwig` |
+
+---
+
+## Usage Examples
+
+**Minimal memory run (1 sample at a time, 2 cores, 4 GB RAM):**
+
+```bash
+python3 rules/scripts/run_batched.py \
+  --batch-size 1 \
+  --cores 2 \
+  --memory 4000
+```
+
+**Standard low-resource run (2 samples per batch, 4 cores, 8 GB RAM):**
+
+```bash
+python3 rules/scripts/run_batched.py \
+  --batch-size 2 \
+  --cores 4 \
+  --memory 8000
+```
+
+**Using a custom config with the mamba frontend:**
+
+```bash
+python3 rules/scripts/run_batched.py \
+  --batch-size 2 \
+  --cores 8 \
+  --memory 16000 \
+  --config config_geo.yaml \
+  --sample-sheet data/fastp/samples_geo.tsv \
+  --conda-frontend mamba
+```
+
+**Dry run to preview batch assignments:**
+
+```bash
+python3 rules/scripts/run_batched.py \
+  --batch-size 3 \
+  --cores 4 \
+  --dry-run
+```
+
+Example dry-run output:
+```
+Total samples: 6
+Batch size: 3
+Total batches: 2
+Cores per batch: 4
+Memory limit: 4000 MB
+Mode: bulk
+
+Batches (dry-run):
+  Batch 1: sample_A, sample_B, sample_C
+  Batch 2: sample_D, sample_E, sample_F
+```
+
+<Note>
+Because each batch calls Snakemake with `--rerun-incomplete`, partial outputs from a crashed batch are automatically cleaned up and re-run in the next attempt. You can safely re-run `run_batched.py` after a failure — Snakemake will skip already-completed target files and pick up from where the failure occurred.
+</Note>

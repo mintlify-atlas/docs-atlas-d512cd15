@@ -1,0 +1,199 @@
+---
+title: "Running the BDB-Genomics ATAC-seq Pipeline in Docker"
+sidebarTitle: "Docker"
+description: "Build the BDB-Genomics host runner image with micromamba, then execute bulk or scATAC pipelines via docker run with per-rule Conda environments."
+---
+
+Docker is the recommended deployment path for macOS and Windows hosts, or for any Linux environment where installing Conda and Singularity system-wide is impractical. The repository ships a `Dockerfile` that builds a lightweight host runner image based on `mambaorg/micromamba:1.5-bullseye-slim`. This image contains only Snakemake and Python — individual rule dependencies (Bowtie2, MACS2, ArchR, and so on) are still downloaded and cached dynamically by Snakemake at runtime through its `--use-conda` mechanism, exactly as they are in a bare-metal Conda installation.
+
+---
+
+## What the Dockerfile Does
+
+```dockerfile
+# Base image: micromamba on Debian Bullseye slim
+FROM mambaorg/micromamba:1.5-bullseye-slim
+
+LABEL maintainer="Himanshu Bhandary <2032ushimanshu@gmail.com>"
+LABEL description="Host runner environment for BDB-Genomics ATAC-seq Pipeline"
+
+WORKDIR /app
+
+# Copy the host-runner environment file and install Snakemake + Python.
+# This layer is cached separately from the pipeline code, so changing a
+# script later does not re-trigger a full Conda solve.
+COPY --chown=$MAMBA_USER:$MAMBA_USER envs/main.yaml /tmp/env.yaml
+
+RUN micromamba install -y -n base -f /tmp/env.yaml && \
+    micromamba clean --all --yes
+
+# Copy the rest of the pipeline code into the container
+COPY --chown=$MAMBA_USER:$MAMBA_USER . /app
+
+ENV PATH="/opt/conda/bin:$PATH"
+
+# ENTRYPOINT wraps snakemake so that all arguments passed to `docker run`
+# are forwarded directly to the snakemake CLI.
+ENTRYPOINT ["/usr/local/bin/_entrypoint.sh", "snakemake"]
+
+# Show help if no arguments are provided
+CMD ["--help"]
+```
+
+<Note>
+`envs/main.yaml` provides the **host runner** dependencies only — Snakemake and Python. It does not bundle Bowtie2, MACS2, ArchR, or any analysis tool. Those are resolved by Snakemake at job execution time via `--use-conda`.
+</Note>
+
+---
+
+## Step-by-Step Setup
+
+<Steps>
+
+### Build the Host Runner Image
+
+Run this once from the repository root. Docker caches the micromamba installation layer, so subsequent rebuilds after code changes are fast.
+
+```bash
+docker build -t bdb-atacseq .
+```
+
+### Prepare Your Workspace
+
+Ensure your `config.yaml`, sample sheet (`data/fastp/samples.tsv`), and reference data are present in the current directory. Docker mounts the current directory into the container at `/app`, which is the working directory the pipeline expects.
+
+```bash
+ls config.yaml data/fastp/samples.tsv data/reference/
+```
+
+### Run the Bulk Pipeline
+
+Mount the workspace and run Snakemake with 8 cores. All Snakemake flags are passed directly through the `ENTRYPOINT`:
+
+```bash
+docker run -it --rm \
+  -v $(pwd):/app \
+  -v /var/run/docker.sock:/var/run/docker.sock \
+  bdb-atacseq --use-conda --cores 8
+```
+
+The `-v /var/run/docker.sock:/var/run/docker.sock` mount exposes the host Docker socket inside the container. This enables Docker-in-Docker (DinD): if any Snakemake rule uses a `container:` directive instead of `conda:`, Snakemake can spin up the required Singularity/Docker container from inside the host runner.
+
+<Warning>
+Mounting `/var/run/docker.sock` grants the container full access to the host Docker daemon. In shared or production environments, evaluate whether this privilege is acceptable before proceeding.
+</Warning>
+
+### Run the scATAC Pipeline
+
+Pass `ATAC_MODE=scatac` as an environment variable with `-e`:
+
+```bash
+docker run -it --rm \
+  -v $(pwd):/app \
+  -e ATAC_MODE=scatac \
+  bdb-atacseq --use-conda --cores 8
+```
+
+### Run with a Profile
+
+Pass the `--profile` flag exactly as you would outside Docker:
+
+```bash
+docker run -it --rm \
+  -v $(pwd):/app \
+  bdb-atacseq --profile profile/local --cores 8
+```
+
+</Steps>
+
+---
+
+## Common Docker Run Patterns
+
+<Tabs>
+  <Tab title="Bulk (default)">
+    ```bash
+    docker run -it --rm \
+      -v $(pwd):/app \
+      -v /var/run/docker.sock:/var/run/docker.sock \
+      bdb-atacseq --use-conda --cores 8
+    ```
+  </Tab>
+  <Tab title="scATAC mode">
+    ```bash
+    docker run -it --rm \
+      -v $(pwd):/app \
+      -e ATAC_MODE=scatac \
+      bdb-atacseq --use-conda --cores 8
+    ```
+  </Tab>
+  <Tab title="With local profile">
+    ```bash
+    docker run -it --rm \
+      -v $(pwd):/app \
+      bdb-atacseq --profile profile/local --cores 8
+    ```
+  </Tab>
+  <Tab title="Dry run">
+    ```bash
+    docker run -it --rm \
+      -v $(pwd):/app \
+      bdb-atacseq --use-conda --cores 8 --dry-run
+    ```
+  </Tab>
+  <Tab title="Config override">
+    ```bash
+    docker run -it --rm \
+      -v $(pwd):/app \
+      bdb-atacseq \
+        --configfile config.yaml custom_override.yaml \
+        --use-conda --cores 8
+    ```
+  </Tab>
+</Tabs>
+
+---
+
+## Docker-in-Docker (DinD) Explained
+
+Some Snakemake rules specify a `container:` URL instead of (or in addition to) a `conda:` environment file. When Snakemake encounters these rules, it attempts to pull and run the specified container. Mounting `/var/run/docker.sock` into the host runner container allows this to work transparently:
+
+```
+Host Docker daemon
+  └── bdb-atacseq (host runner container)
+        └── snakemake
+              └── Pulls and runs tool containers via host Docker socket
+```
+
+If you do not need container-based rules (i.e., all rules in your run use `conda:` environments), you can omit the `/var/run/docker.sock` mount:
+
+```bash
+docker run -it --rm \
+  -v $(pwd):/app \
+  bdb-atacseq --use-conda --cores 8
+```
+
+---
+
+## When to Use Docker
+
+<CardGroup cols={2}>
+  <Card title="macOS" icon="apple">
+    Conda and Singularity have limited native macOS support. Docker Desktop provides a consistent Linux environment on both Intel and Apple Silicon Macs.
+  </Card>
+  <Card title="Windows" icon="windows">
+    The pipeline assumes a POSIX shell. Running inside Docker via WSL 2 or Docker Desktop eliminates path and shell compatibility issues.
+  </Card>
+  <Card title="Restricted Linux Hosts" icon="lock">
+    Environments where you cannot install system packages or where Conda is disallowed by IT policy. Docker requires only Docker itself to be installed.
+  </Card>
+  <Card title="Reproducibility" icon="rotate">
+    The image pins the Snakemake and Python versions via `envs/main.yaml`, producing a consistent execution environment across machines and CI systems.
+  </Card>
+</CardGroup>
+
+---
+
+## Conda Cache Between Runs
+
+By default, Snakemake creates per-rule Conda environments inside the working directory (`.snakemake/conda/`). Because the working directory is mounted from the host (`-v $(pwd):/app`), these environments persist between `docker run` invocations and are not re-solved on subsequent runs. If you need a clean environment cache, delete `.snakemake/conda/` before rerunning.

@@ -1,0 +1,188 @@
+---
+title: "ATAC-seq Alignment: Bowtie2 & Coordinate Sorting"
+sidebarTitle: "Alignment"
+description: "Bulk ATAC-seq alignment with Bowtie2 using --very-sensitive, piped directly into samtools, followed by coordinate sorting."
+---
+
+After quality-trimmed reads leave the preprocessing stage, they are mapped to the reference genome in paired-end mode. In bulk ATAC-seq (the default `ATAC_MODE=bulk`), alignment is performed by Bowtie2 using the `--very-sensitive` preset, which maximises sensitivity at the cost of runtime — an appropriate trade-off for ATAC-seq, where correctly mapping reads near open-chromatin boundaries is essential. The resulting unsorted BAM is piped directly from Bowtie2 through `samtools view` to avoid writing an intermediate SAM file to disk, then coordinate-sorted by a dedicated `samtools sort` rule before the post-alignment filtering chain begins.
+
+<Note>
+  Single-cell ATAC-seq mode (`ATAC_MODE=scatac`) replaces Bowtie2 with **Chromap** (`--preset atac`) and routes output through ArchR for Arrow-file creation and doublet removal. That modality is documented separately in the single-cell modality guide.
+</Note>
+
+## Configuration
+
+```yaml
+# config.yaml
+bowtie2:
+  input: "results/preprocessing/fastp"
+  output: "results/alignment/bowtie2"
+  params:
+    index: "data/reference/index/genome"   # BOWTIE2_INDEX anchor
+    sensitive: "--very-sensitive"
+  threads: 8
+  resources:
+    mem_mb: 16000
+    time: 240
+
+samtools_sort:
+  input:
+    unsorted_bam: "results/alignment/bowtie2"
+  output:
+    sorted_bam: "results/post_alignment/samtools_sort"
+  threads: 4
+  resources:
+    mem_mb: 8000
+    time: 120
+```
+
+The `bowtie2.params.index` key resolves to the YAML anchor `*BOWTIE2_INDEX`, which points to `data/reference/index/genome`. Changing the reference genome in one place (`global.references.bowtie2_index`) automatically propagates to the alignment rule.
+
+## Bowtie2 Alignment
+
+<Steps>
+  <Step title="Input Resolution">
+    The rule resolves R1 and R2 trimmed FASTQ paths dynamically using the sample wildcard, pulling from `results/preprocessing/fastp/`:
+
+    ```python
+    input:
+        R1_fastp = lambda wildcards:
+            f"{config['bowtie2']['input']}/{wildcards.sample}_R1_trimmed.fastq.gz",
+        R2_fastp = lambda wildcards:
+            f"{config['bowtie2']['input']}/{wildcards.sample}_R2_trimmed.fastq.gz"
+    ```
+  </Step>
+  <Step title="Paired-End Alignment">
+    Bowtie2 aligns in paired-end mode (`-1`/`-2`) with `--very-sensitive`, which enables the most exhaustive seed extension strategy in Bowtie2:
+
+    ```bash
+    bowtie2 -x {params.index} \
+            -1 {input.R1_fastp} \
+            -2 {input.R2_fastp} \
+            --very-sensitive \
+            -p {threads} \
+            2> {log}
+    ```
+  </Step>
+  <Step title="On-the-Fly BAM Conversion">
+    The SAM stream from Bowtie2 is piped immediately into `samtools view -Sb` — no intermediate SAM is written to disk. The pipeline uses `set -o pipefail` so that alignment errors inside the pipe are propagated correctly:
+
+    ```bash
+    set -o pipefail
+    bowtie2 ... | samtools view -@ {threads} -Sb - > {output.BAM}
+    ```
+  </Step>
+</Steps>
+
+### Full Rule
+
+```python
+# rules/bowtie2.smk
+rule bowtie2_align:
+    input:
+        R1_fastp = lambda wildcards:
+            f"{config['bowtie2']['input']}/{wildcards.sample}_R1_trimmed.fastq.gz",
+        R2_fastp = lambda wildcards:
+            f"{config['bowtie2']['input']}/{wildcards.sample}_R2_trimmed.fastq.gz"
+    output:
+        BAM = f"{config['bowtie2']['output']}/{sample}.bam"
+    params:
+        index     = config['bowtie2']['params']['index'],
+        sensitive = config['bowtie2']['params']['sensitive']
+    threads: config['bowtie2']['threads']   # 8
+    resources:
+        mem_mb = 16000,
+        time   = 240
+    shell:
+        r"""
+        set -o pipefail
+        bowtie2 -x {params.index} \
+                -1 {input.R1_fastp} \
+                -2 {input.R2_fastp} \
+                {params.sensitive} \
+                -p {threads} \
+                2> {log} | \
+        samtools view -@ {threads} -Sb - > {output.BAM} 2>> {log}
+        """
+```
+
+### Output
+
+| File | Location | Description |
+|---|---|---|
+| `{sample}.bam` | `results/alignment/bowtie2/` | Unsorted BAM; input to `samtools_sort` |
+
+## Coordinate Sorting
+
+The unsorted BAM produced by the alignment step cannot be indexed and is not suitable for the downstream filtering chain, which relies on positional operations (fixmate, markdup, MAPQ filtering). The `samtools_sort` rule converts it to a coordinate-sorted BAM using four threads and 8 GB RAM:
+
+```python
+# rules/samtools_sort.smk
+rule samtools_sort:
+    input:
+        unsorted_bam = lambda wildcards:
+            f"{config['samtools_sort']['input']['unsorted_bam']}/{wildcards.sample}.bam"
+    output:
+        bam_sorted = f"{config['samtools_sort']['output']['sorted_bam']}/{sample}.sorted.bam"
+    threads: config["samtools_sort"]["threads"]   # 4
+    shell:
+        """
+        samtools sort \
+          -@ {threads} \
+          -O BAM \
+          -o {output.bam_sorted} \
+          {input.unsorted_bam} \
+          2> {log}
+        """
+```
+
+### Output
+
+| File | Location | Description |
+|---|---|---|
+| `{sample}.sorted.bam` | `results/post_alignment/samtools_sort/` | Coordinate-sorted BAM; enters post-alignment chain |
+
+## Resource Allocation
+
+<Tabs>
+  <Tab title="Bowtie2">
+    | Parameter | Value |
+    |---|---|
+    | Threads | 8 |
+    | Memory | 16 GB |
+    | Wall-time | 240 min (base, scales on retry) |
+    | Container | `mulled-v2-ac74a7f02306649ee64e819b8830f69904d48507` |
+  </Tab>
+  <Tab title="samtools sort">
+    | Parameter | Value |
+    |---|---|
+    | Threads | 4 |
+    | Memory | 8 GB |
+    | Wall-time | 120 min (base, scales on retry) |
+    | Container | `samtools:1.15.1--h1170115_0` |
+  </Tab>
+</Tabs>
+
+Both rules use the adaptive memory formula — if the input BAM exceeds the config floor, 1.5× input size is requested, and both memory and time scale by `attempt` on retry:
+
+```python
+resources:
+    mem_mb = lambda wildcards, input, attempt:
+        max(config['bowtie2']['resources']['mem_mb'],
+            int(input.size_mb * 1.5)) * attempt,
+    time   = lambda wildcards, attempt:
+        config['bowtie2']['resources']['time'] * attempt
+```
+
+<Tip>
+  For HPC deployments, use the `slurm` profile under `profile/slurm/`. Each rule's `mem_mb` and `time` values map directly to SLURM `--mem` and `--time` directives, so no separate SLURM configuration file is needed beyond the profile's `config.yaml`.
+</Tip>
+
+## Benchmark Files
+
+Each rule writes a Snakemake benchmark file capturing real-world CPU time, wall-clock time, and peak memory:
+
+- `benchmarks/bowtie2/{sample}.txt`
+- `benchmarks/samtools_sort/{sample}.txt`
+
+These are aggregated by the `benchmark_summary` rule into `results/reporting/benchmark_summary.tsv` at the end of the run.
