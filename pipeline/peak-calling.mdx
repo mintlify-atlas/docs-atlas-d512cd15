@@ -1,7 +1,7 @@
 ---
-title: "Peak Calling: MACS2, IDR, DESeq2, TOBIAS & HOMER"
+title: "ATAC-seq Peak Calling: MACS2, IDR, DESeq2, and TOBIAS"
 sidebarTitle: "Peak Calling"
-description: "Complete peak-calling module covering MACS2, blacklist filtering, FRiP, IDR, consensus peaks, DESeq2 DA, TOBIAS footprinting, HINT-ATAC, and HOMER motifs."
+description: "Complete peak-calling module: MACS2, blacklist filtering, FRiP, IDR, consensus peaks, DESeq2 differential accessibility, TOBIAS footprinting, and HOMER."
 ---
 
 Peak calling is the most analytically dense stage of the pipeline. Starting from the Tn5-shifted, QC-gated BAM files, the pipeline calls peaks with MACS2, filters them against the ENCODE blacklist, computes the Fraction of Reads in Peaks, identifies reproducible peaks across replicates with IDR, merges all samples into a consensus peak set, quantifies accessibility with a count matrix, runs DESeq2 for differential accessibility, annotates peaks with ChIPseeker, scans for enriched motifs with HOMER, and performs transcription-factor footprinting with both TOBIAS and HINT-ATAC. Each tool is an independent Snakemake rule and produces outputs in well-defined directories under `results/peak_calling/`.

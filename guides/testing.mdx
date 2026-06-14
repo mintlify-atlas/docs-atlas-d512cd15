@@ -24,14 +24,17 @@ Running the script produces the following artefacts in seven steps:
   <Card title="Gene annotation (GTF)" icon="file-code">
     80 genes (50 on `chr1`, 30 on `chr2`) with gene, transcript, and exon entries written to `data/reference/annotation.gtf`.
   </Card>
-  <Card title="ENCODE blacklist BED" icon="ban">
-    A two-region blacklist (`data/reference/ENCODE_blacklist.bed`) covering known repeat-dense intervals.
+  <Card title="ENCODE blacklist BED + motif database" icon="ban">
+    A two-region blacklist (`data/reference/ENCODE_blacklist.bed`) covering known repeat-dense intervals, plus a minimal MEME motif database written to `data/motifs/jaspar_vertebrates.meme`. Both are generated in the same step.
   </Card>
   <Card title="Bowtie2 index" icon="magnifying-glass">
     Built via `bowtie2-build` if available on `$PATH`; otherwise, valid placeholder `.bt2` binary files are written to `data/reference/index/`.
   </Card>
   <Card title="Paired-end FASTQs" icon="file">
     Four samples (`sample1`–`sample4`) × 7,500 read pairs each, written as gzip-compressed FASTQ to `data/fastq/`. 75% of reads are positioned within ±2,000 bp of a TSS to guarantee non-zero TSS enrichment scores.
+  </Card>
+  <Card title="Chromap index placeholder" icon="database">
+    A placeholder index file written to `data/reference/chromap/genome.index` for scATAC-seq compatibility. The sample sheet (`data/fastp/samples.tsv`) is also written in this final step.
   </Card>
 </CardGroup>
 
@@ -140,7 +143,7 @@ The workflow has two sequential jobs:
 
 <CardGroup cols={2}>
   <Card title="lint" icon="check">
-    Runs `validate_config.py`, `snakemake --lint`, and `pytest rules/scripts/test_validate_config.py` to catch config errors and rule syntax issues before any computation starts.
+    Generates synthetic test data, then runs `snakemake --lint` and `pytest rules/scripts/test_validate_config.py` to catch config errors and rule syntax issues before any computation starts. Finishes with a dry-run (`snakemake -n`) to validate the full DAG.
   </Card>
   <Card title="test" icon="flask">
     Depends on `lint`. Generates synthetic data and executes `snakemake --use-conda --conda-frontend mamba --profile profile/test --cores 4`. Results and logs are uploaded as GitHub Actions artifacts (retained 7 days).

@@ -11,7 +11,7 @@ The sorted BAM that leaves the alignment stage is not yet suitable for peak call
 ```
 {sample}.sorted.bam                      ← from samtools_sort
     │
-    ├─ calculate_mito_reads ─────────────► mito_stats.txt
+    ├─ calculate_mito_reads ─────────────► mito_stats.txt (QC reporting)
     │
     ▼
 samtools_fixmate                          ← mate-pair information for markdup
@@ -19,10 +19,10 @@ samtools_fixmate                          ← mate-pair information for markdup
     ▼
 samtools_markdup                          ← duplicate flagging (mark, not remove)
     │
-    ├─ samtools_stats ────────────────────► {sample}_postFiltering.stats.txt
-    │
     ▼
 remove_mito_reads                         ← exclude chrMT
+    │
+    ├─ samtools_stats ────────────────────► {sample}_postFiltering.stats.txt
     │
     ▼
 samtools_view (MAPQ ≥ 30, -F 3844 -f 2)  ← alignment quality gate

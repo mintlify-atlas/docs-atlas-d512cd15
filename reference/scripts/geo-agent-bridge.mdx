@@ -1,20 +1,20 @@
 ---
 title: "geo_agent_bridge.py: GEOAgent Metadata Import CLI Reference"
 sidebarTitle: "geo-agent-bridge"
-description: "CLI reference for geo_agent_bridge.py — bridges GEOAgent/bioStream ATAC-seq metadata CSVs to a BDB pipeline-ready config and sample sheet, with optional SRA download."
+description: "CLI reference for geo_agent_bridge.py — converts GEOAgent metadata CSVs into a BDB-ready config and sample sheet, with optional SRA FASTQ download."
 ---
 
 `geo_agent_bridge.py` connects GEOAgent or bioStream metadata exports directly to the BDB-Genomics ATAC-seq pipeline. Given a metadata CSV that describes GEO samples and their associated SRR accessions, the script infers conditions, replicates, and FASTQ paths; writes a pipeline-ready TSV sample sheet; and generates a `config_geo.yaml` config file that inherits all settings from the base `config.yaml` with only `global.samples` overridden to point at the generated sample sheet. If the `--download` flag is passed, it also fetches and extracts SRA FASTQ files automatically.
 
 ```bash
-python3 rules/scripts/geo_agent_bridge.py <csv_path> [--download]
+python3 rules/scripts/geo_agent_bridge.py <meta_csv> [--download]
 ```
 
 ---
 
 ## Arguments
 
-<ParamField path="csv_path" type="string" required>
+<ParamField path="meta_csv" type="string" required>
   Path to the GEOAgent or bioStream metadata CSV file (positional argument). Accepts comma or tab-delimited files — the delimiter is auto-detected using Python's `csv.Sniffer`. Column names are stripped of surrounding whitespace before parsing.
 </ParamField>
 

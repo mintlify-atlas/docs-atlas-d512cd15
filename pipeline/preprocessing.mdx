@@ -1,7 +1,7 @@
 ---
-title: "ATAC-seq Preprocessing: fastp Trimming & FastQC"
+title: "ATAC-seq Preprocessing: fastp Trimming and FastQC Reports"
 sidebarTitle: "Preprocessing"
-description: "How the pipeline trims adapters and 5′ Tn5 bias with fastp, then runs FastQC quality reports on every trimmed FASTQ pair."
+description: "How the pipeline trims Nextera adapters and 5′ Tn5 insertion bias with fastp, then runs FastQC quality reports on every trimmed FASTQ pair."
 ---
 
 Raw ATAC-seq paired-end reads carry two sources of contamination that must be removed before alignment: residual Nextera adapter sequences introduced during library preparation, and the well-characterized Tn5 insertion bias at the extreme 5′ end of each read. The pipeline handles both in a single `fastp` pass per sample, then immediately feeds the trimmed FASTQs into `FastQC` to produce per-base-quality and adapter-content reports. Both steps are fully parallelized and containerized, and every output path is resolved from `config.yaml` so no rule file ever needs editing.

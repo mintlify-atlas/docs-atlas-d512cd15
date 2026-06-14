@@ -1,7 +1,7 @@
 ---
 title: "parse_qc_metrics.py: QC Gate Evaluation CLI Reference"
 sidebarTitle: "parse-qc-metrics"
-description: "Complete CLI reference for parse_qc_metrics.py — the script that evaluates FRiP, TSS enrichment, mapping rate, and duplicate rate and writes pass/fail trigger files."
+description: "CLI reference for parse_qc_metrics.py — evaluates FRiP, TSS enrichment, mapping rate, and duplicate rate, then writes PASS/FAIL trigger files per sample."
 ---
 
 `parse_qc_metrics.py` is the QC gate engine. It is invoked once per sample by the `qc_gate` Snakemake rule after FRiP calculation, TSS enrichment scoring, and `samtools stats` have completed. The script reads the three metric files, evaluates each measurement against its configured threshold, applies WARN/FAIL tiering, and writes three output files: a plain-text log, a structured JSON report, and a single-line trigger file that downstream Snakemake rules consume as a mandatory input dependency.

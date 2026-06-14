@@ -1,7 +1,7 @@
 ---
-title: "Execution Profiles for Local, HPC, and Cloud"
+title: "Snakemake Execution Profiles: Local, HPC, and Cloud"
 sidebarTitle: "Profiles"
-description: "Reference for all 8 Snakemake execution profiles: local, SLURM, low-resource, test, AWS, GCP, Azure, and Kubernetes."
+description: "Reference for all 8 Snakemake execution profiles: local, SLURM, low-resource, test, AWS Batch, GCP Life Sciences, Azure Batch, and Kubernetes."
 ---
 
 Snakemake profiles are directories containing a `config.yaml` that pre-configure the executor, resource defaults, and scheduler behaviour for a specific compute environment. Instead of passing dozens of flags on the command line, you select a profile with `--profile profile/<name>` and all settings load automatically. The BDB-Genomics ATAC-seq pipeline ships eight profiles covering every major execution target, from a laptop to multi-cloud Kubernetes clusters.
@@ -118,6 +118,8 @@ snakemake --profile profile/low_resource
 # profile/low_resource/config.yaml
 use-conda: true
 jobs: 2
+printshellcmds: true
+show-failed-logs: true
 keep-going: true
 rerun-incomplete: true
 restart-times: 0
@@ -229,6 +231,8 @@ executor: tibanna
 use-conda: true
 use-singularity: true
 jobs: 50
+printshellcmds: true
+show-failed-logs: true
 keep-going: true
 rerun-incomplete: true
 restart-times: 1
@@ -296,6 +300,8 @@ executor: google-lifesciences
 use-conda: true
 use-singularity: true
 jobs: 50
+printshellcmds: true
+show-failed-logs: true
 keep-going: true
 rerun-incomplete: true
 restart-times: 1
@@ -363,6 +369,8 @@ executor: azure-batch
 use-conda: true
 use-singularity: true
 jobs: 50
+printshellcmds: true
+show-failed-logs: true
 keep-going: true
 rerun-incomplete: true
 restart-times: 1
@@ -435,6 +443,8 @@ executor: kubernetes
 use-conda: true
 use-singularity: true
 jobs: 50
+printshellcmds: true
+show-failed-logs: true
 keep-going: true
 rerun-incomplete: true
 restart-times: 1

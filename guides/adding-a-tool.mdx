@@ -15,14 +15,16 @@ Every tool runs inside its own isolated Conda environment. Create the environmen
 Use `rules/envs/misc/template_tool.yaml` as your starting point:
 
 ```yaml
-# rules/envs/misc/template_tool.yaml  (exact source content)
+# [TEMPLATE] The name of the virtual environment to be created.
 name: template_env
 
+# [TEMPLATE] The package channels Conda should search. Usually bioconda and conda-forge.
 channels:
   - conda-forge
   - bioconda
   - defaults
 
+# [TEMPLATE] List the exact tools and versions required for this step.
 dependencies:
   - coreutils
 ```
@@ -38,7 +40,6 @@ Pin major versions (e.g., `macs3=3.0.0`) to ensure reproducibility across CI run
 Create `rules/<toolname>.smk`. Copy `rules/template_tool.smk` as boilerplate — it encodes every design constraint the pipeline enforces:
 
 ```python
-# rules/template_tool.smk
 # [TEMPLATE] Name your rule here.
 rule template_tool:
     # [TEMPLATE] Define inputs by pointing to the config file path dynamically.
@@ -57,6 +58,7 @@ rule template_tool:
     resources:
         mem_mb=lambda wildcards, input, attempt: max(config['template_category']['template_tool']['resources']['mem_mb'], int(input.size_mb * 1.5)) * attempt,
         time=lambda wildcards, attempt: config['template_category']['template_tool']['resources']['time'] * attempt,
+    
 
     log: "logs/template_category/template_tool/{sample}.log"
     conda: "envs/misc/template_tool.yaml"
@@ -66,7 +68,9 @@ rule template_tool:
     # [TEMPLATE] Specify where logs and benchmarks will be saved.
     benchmark: "benchmarks/template_category/template_tool/{sample}.txt"
     
-    # [TEMPLATE] The actual bash commands to run the tool.
+    # [TEMPLATE] Provide the path to the isolated Conda environment file.
+    
+    # [TEMPLATE] The actual bash commands to run the tool. Use {input}, {output}, {params}, etc.
     shell:
         """
         echo "{params.message} Sample: {wildcards.sample}" > {output.dummy_out} 2> {log}
@@ -153,7 +157,7 @@ python3 rules/scripts/validate_config.py
 A successful run prints a summary of every validated key. Any missing required field or type mismatch is reported as an error with the offending key path.
 
 <Warning>
-The CI pipeline runs `validate_config.py` as its first step. A config that fails validation will block the entire workflow from starting.
+The CI `lint` job runs `pytest rules/scripts/test_validate_config.py`, which exercises `validate_config.py` against the checked-in config. A config that fails validation will cause the lint job to fail and block the `test` job from starting.
 </Warning>
 
 ### Test with synthetic data
@@ -162,7 +166,8 @@ Generate the minimal CI dataset and run the full pipeline to confirm your new ru
 
 ```bash
 # Step 1: generate synthetic FASTQs, reference genome, GTF, Bowtie2 index,
-#         chrom.sizes, and ENCODE blacklist BED (no internet required)
+#         chrom.sizes, ENCODE blacklist BED, motif database, and Chromap index
+#         placeholder (no internet required)
 python3 rules/scripts/generate_test_data.py
 
 # Step 2: run the pipeline — your new rule will be scheduled automatically

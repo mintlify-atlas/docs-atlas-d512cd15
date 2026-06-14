@@ -26,6 +26,7 @@ rerun-incomplete: true
 restart-times: 0
 latency-wait: 30
 
+# Global resource caps — Snakemake will never exceed these totals
 set-resources:
   bowtie2_align:
     mem_mb: 4000
@@ -49,6 +50,14 @@ set-resources:
 
   tss_enrichment:
     mem_mb: 4000
+    threads: 2
+
+  picard_CollectAlignmentSummaryMetrics:
+    mem_mb: 3000
+    threads: 2
+
+  picard_CollectInsertSizeMetrics:
+    mem_mb: 3000
     threads: 2
 
   heatmap:
@@ -87,14 +96,6 @@ set-resources:
     mem_mb: 4000
     threads: 2
 
-  correlation_analysis:
-    mem_mb: 3000
-    threads: 2
-
-  normalized_coverage:
-    mem_mb: 3000
-    threads: 2
-
   preseq:
     mem_mb: 2000
     threads: 1
@@ -103,13 +104,93 @@ set-resources:
     mem_mb: 3000
     threads: 2
 
+  correlation_analysis:
+    mem_mb: 3000
+    threads: 2
+
+  normalized_coverage:
+    mem_mb: 3000
+    threads: 2
+
+  bedtools_genomecov:
+    mem_mb: 3000
+    threads: 2
+
+  bigwig_conversion:
+    mem_mb: 2000
+    threads: 1
+
+  sorted_bedgraph:
+    mem_mb: 2000
+    threads: 2
+
+  frip_calculation:
+    mem_mb: 2000
+    threads: 1
+
+  blacklist_region_filter:
+    mem_mb: 2000
+    threads: 1
+
+  idr_analysis:
+    mem_mb: 2000
+    threads: 1
+
+  cross_correlation:
+    mem_mb: 4000
+    threads: 2
+
   consensus_peaks:
     mem_mb: 3000
     threads: 2
 
+  count_peaks:
+    mem_mb: 2000
+    threads: 1
+
   fastp_trim:
     mem_mb: 3000
     threads: 2
+
+  fastqc:
+    mem_mb: 2000
+    threads: 2
+
+  samtools_stats:
+    mem_mb: 2000
+    threads: 1
+
+  fragment_size_analysis:
+    mem_mb: 2000
+    threads: 1
+
+  samtools_fixmate:
+    mem_mb: 2000
+    threads: 1
+
+  samtools_index:
+    mem_mb: 1000
+    threads: 1
+
+  samtools_index_post_filter:
+    mem_mb: 1000
+    threads: 1
+
+  samtools_index_postmarkdup:
+    mem_mb: 1000
+    threads: 1
+
+  samtools_view:
+    mem_mb: 2000
+    threads: 1
+
+  calculate_mito_reads:
+    mem_mb: 1000
+    threads: 1
+
+  remove_mito_reads:
+    mem_mb: 2000
+    threads: 1
 
   qc_gate:
     mem_mb: 1000
@@ -117,6 +198,10 @@ set-resources:
 
   multiqc:
     mem_mb: 2000
+    threads: 1
+
+  benchmark_summary:
+    mem_mb: 1000
     threads: 1
 
 # Fallback for any rule not listed above
@@ -176,8 +261,8 @@ Each batch invocation passes the specific per-sample target files (fastp trimmed
 ### Basic Usage
 
 ```bash
-# Process two samples at a time, 8 cores, using the low_resource profile
-python3 rules/scripts/run_batched.py --batch-size 2 --cores 8 --profile profile/local
+# Process two samples at a time, 8 cores (profile/low_resource is used internally)
+python3 rules/scripts/run_batched.py --batch-size 2 --cores 8
 ```
 
 ```bash

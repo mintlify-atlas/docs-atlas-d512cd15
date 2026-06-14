@@ -1,7 +1,7 @@
 ---
 title: "BDB ATAC-seq Pipeline: Full config.yaml Schema Reference"
 sidebarTitle: "Config Schema"
-description: "Complete reference for every top-level key and sub-key in config.yaml, including input/output paths, parameters, thread counts, and resource limits for each pipeline tool."
+description: "Complete reference for every top-level key in config.yaml, including input/output paths, parameters, thread counts, and resource limits per tool."
 ---
 
 The `config.yaml` file is the single source of truth for the BDB-Genomics ATAC-seq framework. Every tool, path, resource limit, and QC threshold is declared here; Snakemake rules are stateless wrappers that read from this config at runtime. YAML anchors (e.g., `&GENOME_FA`, `*GENOME_FA`) centralise reference file paths so that changing one entry propagates everywhere automatically. Every tool block follows a uniform schema - `input → output → params → threads → resources` - making it straightforward to add new stages without touching existing ones.

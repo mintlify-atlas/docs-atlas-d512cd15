@@ -112,11 +112,13 @@ def check(metric, val, target, operator='>='):
 
 | Status | Condition (FRiP example, threshold = 0.2) |
 |---|---|
-| **PASS** | FRiP ≥ 0.22 (above 110% of threshold) |
-| **WARN** | 0.18 ≤ FRiP < 0.22 (between 90–110% of threshold) |
-| **FAIL** | FRiP < 0.18 (below threshold) |
+| **PASS** | FRiP ≥ 0.2 (meets or exceeds threshold) |
+| **WARN** | FRiP ≥ 0.2 and FRiP < 0.18 — unreachable in practice (see note below) |
+| **FAIL** | FRiP < 0.2 (below hard threshold) |
 
-The `overall` status is `PASSED` only if all four metrics individually pass (no `FAIL`). A sample with any `WARN` still gets an overall `PASSED`.
+<Note>
+  The `WARN` branch uses an `elif` that is evaluated only when the hard-fail condition is false (i.e., `val >= target`). For `>=` metrics, `warn_threshold = target × 0.9`, so the `WARN` condition (`val < 0.18`) can never be true when `val >= 0.2`. In the current implementation, each metric resolves to either `PASS` or `FAIL` — the `WARN` path exists in the code as a guard for future threshold adjustments but is not reachable with the default logic. The `overall` field is `PASSED` only when all four metrics are individually `PASS`.
+</Note>
 
 ## Output Files
 

@@ -270,20 +270,17 @@ On every run — success or failure — the `onsuccess`/`onerror` lifecycle hook
 
 ```json
 {
-    "status": "success",
     "timestamp": "2026-01-15T14:32:07",
-    "rules": {
-        "bowtie2_align": {
-            "sample_A": { "cpu_time_s": 342.1, "peak_mem_mb": 14823 },
-            "sample_B": { "cpu_time_s": 287.4, "peak_mem_mb": 13411 }
-        },
-        "macs2_peak_calling": { ... }
-    },
+    "status": "success",
+    "performance_metrics": [
+        { "s": "342.1", "h:m:s": "0:05:42", "max_rss": "14823", "rule": "bowtie2" },
+        { "s": "287.4", "h:m:s": "0:04:47", "max_rss": "13411", "rule": "macs2" }
+    ],
     "errors": []
 }
 ```
 
-On failure, the `errors` array contains the last five lines from each affected log file, enabling rapid post-mortem diagnosis without manually `grep`-ing through the `logs/` directory.
+On failure, the `errors` array contains the last five error-matching lines from each affected log file (filtered to exclude false positives such as "0 errors"), enabling rapid post-mortem diagnosis without manually `grep`-ing through the `logs/` directory.
 
 Output: `results/reporting/pipeline_execution_summary.json`
 

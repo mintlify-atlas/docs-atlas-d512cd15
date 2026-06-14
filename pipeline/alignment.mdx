@@ -1,7 +1,7 @@
 ---
-title: "ATAC-seq Alignment: Bowtie2 & Coordinate Sorting"
+title: "ATAC-seq Alignment: Bowtie2 Mapping and Coordinate Sorting"
 sidebarTitle: "Alignment"
-description: "Bulk ATAC-seq alignment with Bowtie2 using --very-sensitive, piped directly into samtools, followed by coordinate sorting."
+description: "Bulk ATAC-seq alignment with Bowtie2 using --very-sensitive, piped into samtools for BAM conversion, then coordinate-sorted for downstream filtering."
 ---
 
 After quality-trimmed reads leave the preprocessing stage, they are mapped to the reference genome in paired-end mode. In bulk ATAC-seq (the default `ATAC_MODE=bulk`), alignment is performed by Bowtie2 using the `--very-sensitive` preset, which maximises sensitivity at the cost of runtime — an appropriate trade-off for ATAC-seq, where correctly mapping reads near open-chromatin boundaries is essential. The resulting unsorted BAM is piped directly from Bowtie2 through `samtools view` to avoid writing an intermediate SAM file to disk, then coordinate-sorted by a dedicated `samtools sort` rule before the post-alignment filtering chain begins.

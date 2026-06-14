@@ -65,9 +65,9 @@ Derived from **Picard `CollectInsertSizeMetrics`** run on the deduplicated BAM (
 
 | Band | Fragment Range | Interpretation |
 |---|---|---|
-| Sub-nucleosomal | < 200 bp | Nucleosome-free regions (NFR); highest signal expected |
+| Sub-nucleosomal | &lt;200 bp | Nucleosome-free regions (NFR); highest signal expected |
 | Mono-nucleosomal | 200 – 400 bp | Reads wrapping a single nucleosome |
-| Di-nucleosomal | > 400 bp | Reads spanning two nucleosomes |
+| Di-nucleosomal | &gt;400 bp | Reads spanning two nucleosomes |
 
 A healthy ATAC-seq library shows a pronounced NFR peak with decreasing amplitude at each nucleosomal harmonic. Absent or inverted banding patterns indicate degraded chromatin or incomplete Tn5 tagmentation.
 
@@ -83,8 +83,8 @@ Computed by **phantompeakqualtools** from the filtered BAM (`results/metrics_qc/
 
 | Metric | Description | ENCODE Threshold |
 |---|---|---|
-| NSC | Normalized Strand Cross-correlation coefficient | > 1.05 recommended |
-| RSC | Relative Strand Cross-correlation coefficient | > 0.8 recommended |
+| NSC | Normalized Strand Cross-correlation coefficient | &gt;1.05 recommended |
+| RSC | Relative Strand Cross-correlation coefficient | &gt;0.8 recommended |
 
 Cross-correlation is run with `max_range: 150` bp and `num_threads: 4` (from `config.yaml`). Low NSC/RSC values indicate poor signal enrichment and may correlate with FRiP failure.
 

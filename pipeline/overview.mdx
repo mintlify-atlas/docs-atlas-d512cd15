@@ -1,7 +1,7 @@
 ---
-title: "BDB-Genomics ATAC-seq Pipeline: Full Overview"
+title: "BDB-Genomics ATAC-seq Pipeline Architecture Overview"
 sidebarTitle: "Overview"
-description: "End-to-end ATAC-seq framework covering all six pipeline stages, mode-switching logic, lifecycle hooks, and output directory structure."
+description: "End-to-end ATAC-seq framework covering all six pipeline stages, modality switching, lifecycle hooks, and the full output directory structure."
 ---
 
 The BDB-Genomics ATAC-seq Framework is a production-grade, config-driven Snakemake workflow for end-to-end chromatin accessibility analysis. Starting from raw paired-end FASTQ files, it executes six tightly ordered stages — Preprocessing, Alignment, Post-Alignment filtering, Metrics & QC, Peak Calling, and Visualization/Reporting — and produces a fully auditable set of BAMs, peak files, differential-accessibility tables, TF-footprint BigWigs, and an aggregated MultiQC HTML report. The entire pipeline is driven by a single `config.yaml` file; no Snakemake rule ever needs to be modified for routine use. Both bulk and single-cell modalities are supported from the same codebase, switched entirely through an environment variable.

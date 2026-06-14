@@ -122,8 +122,9 @@ On successful completion, all outputs are written to the `results/` directory, o
 
 | Directory | Contents |
 |---|---|
-| `results/alignment/` | Post-filtered, sorted, Tn5-shifted BAMs |
-| `results/metrics_qc/` | MultiQC HTML report aggregating FastQC, Preseq, Picard, and QC Gate JSONs |
+| `results/alignment/` | Initial Bowtie2-aligned BAMs |
+| `results/post_alignment/` | Sorted, deduplicated, blacklist-filtered, and Tn5-shifted BAMs |
+| `results/metrics_qc/` | Picard, TSS enrichment, fragment size, and cross-correlation metrics |
 | `results/peak_calling/` | MACS2 narrowPeak files, consensus BEDs, and IDR replicate sets |
 | `results/peak_calling/differential_accessibility/` | DESeq2 tables, Volcano/MA/PCA plots |
 | `results/peak_calling/footprinting/` | HINT-ATAC footprint BEDs |

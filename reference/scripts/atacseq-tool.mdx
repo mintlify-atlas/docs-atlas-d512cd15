@@ -1,7 +1,7 @@
 ---
 title: "atacseq_tool.py: LangChain Pipeline Tool Wrapper Reference"
 sidebarTitle: "atacseq-tool"
-description: "Reference for the run_atacseq_pipeline LangChain tool that exposes the BDB ATAC-seq pipeline to AI agents, with all parameters, execution steps, and registration instructions."
+description: "Reference for the run_atacseq_pipeline LangChain tool that exposes the BDB ATAC-seq pipeline to AI agents, covering all parameters and execution steps."
 ---
 
 `atacseq_tool.py` exposes the complete BDB-Genomics ATAC-seq pipeline as a callable LangChain tool, making the end-to-end genomic analysis workflow accessible to AI agents and automated orchestration systems. The `run_atacseq_pipeline` function is decorated with `@tool("run_atacseq_pipeline")`, which registers it in LangChain's tool registry so agents can invoke it by name, passing structured arguments. The function handles pre-flight validation, optional GEOAgent data import, Snakemake execution (standard or batched), and returns a detailed status string that includes the structured execution summary if one is available.

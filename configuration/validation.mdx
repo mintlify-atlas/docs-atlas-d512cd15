@@ -1,5 +1,5 @@
 ---
-title: "Config Validation: validate_config.py Reference"
+title: "validate_config.py: ATAC-seq Config Validation Guide"
 sidebarTitle: "Validation"
 description: "How validate_config.py auto-validates config keys, sample sheets, FASTQ paths, conda envs, and reference files before the DAG builds."
 ---
@@ -52,7 +52,7 @@ python3 rules/scripts/validate_config.py config.yaml
 
 ## Validation Stages
 
-The validator executes seven distinct checks in sequence. All errors are accumulated across every stage and printed together — the run does not stop at the first error.
+The validator executes eight distinct checks in sequence. All errors are accumulated across every stage and printed together — the run does not stop at the first error.
 
 <Steps>
   <Step title="Config file existence and YAML syntax">
@@ -158,6 +158,29 @@ The validator executes seven distinct checks in sequence. All errors are accumul
         key.endswith(("_fa", "_bed", "_gtf", "_index", "_sizes", "_db")) or
         key == "blacklist"
     ))
+    ```
+  </Step>
+
+  <Step title="Sample sheet config-key usage check">
+    The validator scans every `.smk` file under `rules/` for patterns that treat `config['samples']` as a list of sample names (e.g. `sample = config["samples"]`) rather than as the expected sample-sheet path string. If `global.samples` is a path string in `config.yaml` but any rule file reads it as a list, an error is reported identifying the offending rule files.
+
+    ```python
+    SAMPLES_LIST_USAGE_PATTERN = re.compile(r"sample\s*=\s*config\[['\"]samples['\"]\]")
+
+    def validate_samples_usage(root: Path, config: dict[str, Any], errors: list[str]) -> None:
+        samples_value = get_config_value(config, ("global", "samples"))
+        if isinstance(samples_value, list):
+            return
+        offenders: list[str] = []
+        for workflow_file in sorted((root / "rules").glob("*.smk")):
+            text = workflow_file.read_text(encoding="utf-8")
+            if SAMPLES_LIST_USAGE_PATTERN.search(text):
+                offenders.append(str(workflow_file.relative_to(root)))
+        if offenders and isinstance(samples_value, str):
+            errors.append(
+                "Top-level config key 'samples' is a sample-sheet path string, but these rules use it "
+                "as a list of sample names: " + ", ".join(offenders)
+            )
     ```
   </Step>
 

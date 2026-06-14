@@ -160,7 +160,7 @@ Paths prefixed with `{sample}` expand to one file per entry in your `data/fastp/
   Raw `samtools stats` output files consumed by the QC gate.
 
   <Expandable title="Key files">
-    <ResponseField name="{sample}_samtools_stats.txt" type="file">
+    <ResponseField name="{sample}_postFiltering.stats.txt" type="file">
       Full `samtools stats` output. The QC gate script extracts `sequences`, `reads duplicated`, and `percentage of properly paired reads` from the `SN` section.
     </ResponseField>
   </Expandable>
@@ -187,10 +187,10 @@ Paths prefixed with `{sample}` expand to one file per entry in your `data/fastp/
   Picard tool outputs for alignment and insert-size QC.
 
   <Expandable title="Key files">
-    <ResponseField name="CollectAlignmentSummaryMetrics/{sample}.alignment_summary_metrics" type="file">
+    <ResponseField name="CollectAlignmentSummaryMetrics/{sample}.alignment_metrics.txt" type="file">
       Picard alignment summary: total reads, mapped rate, strand balance, and chimeric read fraction.
     </ResponseField>
-    <ResponseField name="CollectInsertSizeMetrics/{sample}.insert_size_metrics" type="file">
+    <ResponseField name="CollectInsertSizeMetrics/{sample}.insert_metrics.txt" type="file">
       Picard insert-size summary statistics, including median insert size and mean insert size.
     </ResponseField>
     <ResponseField name="CollectInsertSizeMetrics/{sample}.insert_size_histogram.pdf" type="file">

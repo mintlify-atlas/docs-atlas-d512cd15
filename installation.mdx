@@ -131,13 +131,14 @@ Before choosing an installation method, confirm your system meets these baseline
     The per-rule environment files live at `rules/envs/` and follow the standard Conda YAML format. You can inspect or modify them to pin specific tool versions:
 
     ```yaml
-    # Example: rules/envs/bowtie2.yaml (illustrative)
+    # Example: rules/envs/02_alignment/bowtie2.yaml
+    name: bowtie2
     channels:
       - conda-forge
       - bioconda
     dependencies:
-      - bowtie2
-      - samtools
+      - bowtie2=2.5.4
+      - samtools=1.22
     ```
 
     <Note>

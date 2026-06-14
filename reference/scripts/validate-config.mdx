@@ -1,7 +1,7 @@
 ---
-title: "validate_config.py: Pre-flight Config Validation CLI Reference"
+title: "validate_config.py: Pipeline Config Validation Reference"
 sidebarTitle: "validate-config"
-description: "CLI reference for validate_config.py — the pre-flight script that checks config.yaml schema, reference paths, sample sheet integrity, and Conda environments before the DAG builds."
+description: "CLI reference for validate_config.py — validates config.yaml schema, reference paths, sample sheet integrity, and Conda environments before DAG builds."
 ---
 
 `validate_config.py` is the first thing the pipeline runs. The Snakemake `Snakefile` invokes it automatically via `subprocess.run` at parse time, before Snakemake constructs the DAG, so configuration errors surface immediately with actionable messages rather than cryptic rule failures mid-run. You can also call it manually — for example, in CI before submitting a cluster job — to validate a configuration file without triggering a full pipeline run.
